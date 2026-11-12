@@ -1,0 +1,12 @@
+# Used by `chokepoint start` when no profile and no --lan are given.
+# Copy it to ~/.config/chokepoint/profiles/default.yml and adapt it to your machine
+# (profiles there take precedence over the bundled ones).
+description: "Share the default upstream with the device on eth1"
+lan: eth1                 # interface your clients are plugged into (see: chokepoint check)
+wan: auto                 # interface of the default route
+address: 192.168.50.1/24
+dhcp:
+  range: 192.168.50.10-192.168.50.100
+  lease: 12h
+dns:
+  upstream: [1.1.1.1, 9.9.9.9]

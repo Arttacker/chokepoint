@@ -1,0 +1,20 @@
+description: "Infra lab: static leases, local DNS names, published services"
+lan: eth1
+address: 10.20.0.1/24
+dhcp:
+  range: 10.20.0.100-10.20.0.200
+  lease: 24h
+  reservations:
+    - "aa:bb:cc:dd:ee:01,10.20.0.10,switch"
+    - "aa:bb:cc:dd:ee:02,10.20.0.11,nas"
+  options:
+    - "option:ntp-server,10.20.0.1"
+dns:
+  domain: lab
+  records:
+    - "grafana=10.20.0.11"
+    - "vault.lab=10.20.0.12"
+firewall:
+  port_forwards:
+    - "tcp:8443:10.20.0.11:443"
+    - "tcp:2222:10.20.0.10:22"

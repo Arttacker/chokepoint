@@ -1,0 +1,9 @@
+# captures, logs and backups
+*.pcap
+*.pcapng
+*.log
+*.bak
+*.orig
+# local/private profiles (keep personal settings out of the repo)
+profiles/local-*.yml
+profiles/*.local.yml

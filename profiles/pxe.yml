@@ -1,0 +1,8 @@
+description: "PXE/TFTP boot server for OS deployment"
+lan: eth1
+address: 10.88.0.1/24
+dhcp:
+  lease: 2h
+  pxe:
+    tftp_root: /srv/tftp
+    boot_file: pxelinux.0     # UEFI: ipxe.efi / grubx64.efi

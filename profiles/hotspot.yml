@@ -1,0 +1,14 @@
+description: "Wi-Fi access point on a USB dongle with ad blocking"
+lan: wlan1                  # Wi-Fi card NOT used for your own connection
+wan: auto
+address: 192.168.77.1/24
+wifi:
+  ssid: "LabNet"
+  passphrase: ""            # set here (chmod 600 the file) or: CP_WIFI_PASSPHRASE=... chokepoint start -p hotspot
+  band: g
+  channel: 6
+  country: US
+dns:
+  blocklist_urls:
+    - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+  block_domains: [doubleclick.net]

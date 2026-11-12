@@ -1,0 +1,13 @@
+description: "Intercept device traffic with Burp/mitmproxy on :8080 (transparent mode)"
+lan: eth1
+address: 10.77.0.1/24
+dns:
+  log_queries: true
+  force: true
+firewall:
+  transparent_proxy: 8080
+  proxy_ports: "80,443"
+  block_dot: true
+  isolate_host: true
+hooks:
+  post_up: "echo 'Start your proxy: mitmproxy --mode transparent --showhost -p 8080'"

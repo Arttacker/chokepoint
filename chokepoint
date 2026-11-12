@@ -1,0 +1,1648 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  chokepoint - turn a Linux machine into a temporary, full-featured router
+#  https://github.com/Arttacker/chokepoint            MIT License
+# =============================================================================
+#  Shares an upstream ("WAN") connection with devices on a LAN port or a Wi-Fi
+#  access point: DHCP, caching DNS, local DNS records, ad/malware blocklists,
+#  static leases, port forwarding, transparent-proxy redirect (Burp/mitmproxy),
+#  sandbox isolation, bandwidth shaping, PXE/TFTP boot, packet capture, scans.
+#
+#  Nothing is persistent: `stop` (or a reboot) undoes every change.
+#  Config precedence:  CLI flags > CP_* env vars > YAML profile(s) > defaults
+#  Run `chokepoint help` for usage and examples.
+# =============================================================================
+set -uo pipefail
+export PATH="$PATH:/usr/sbin:/sbin"
+
+VERSION=1.0.0
+SCRIPT_PATH=$(readlink -f "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+PROG=$(basename "$SCRIPT_PATH")
+RUN_ROOT=/run/chokepoint
+REAL_USER=${SUDO_USER:-${USER:-root}}
+USER_HOME=$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6)
+USER_HOME=${USER_HOME:-$HOME}
+PROFILE_DIRS=()
+[[ -n ${CHOKEPOINT_PROFILES:-} ]] && PROFILE_DIRS+=("$CHOKEPOINT_PROFILES")
+PROFILE_DIRS+=("$USER_HOME/.config/chokepoint/profiles" "/etc/chokepoint/profiles")
+for _d in "$SCRIPT_DIR/../share/chokepoint/profiles" "$SCRIPT_DIR/profiles"; do
+  [[ -d $_d ]] && PROFILE_DIRS+=("$(readlink -f "$_d")")
+done
+unset _d
+
+# ----------------------------------------------------------------------------
+# Output helpers
+# ----------------------------------------------------------------------------
+set_colors() {
+  if [[ -t 1 && -z ${NO_COLOR:-} && ${1:-} != off ]]; then
+    B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' M=$'\e[35m' N=$'\e[0m'
+  else
+    B='' D='' R='' G='' Y='' C='' M='' N=''
+  fi
+}
+set_colors
+info()  { printf '%s\n' "${C}::${N} $*"; }
+ok()    { printf '%s\n' "${G}✔${N} $*"; }
+warn()  { printf '%s\n' "${Y}!${N} $*" >&2; }
+err()   { printf '%s\n' "${R}✘ $*${N}" >&2; }
+step()  { printf '%s\n' "${B}→${N} $*"; }
+ROLLBACK=0
+die() {
+  err "$*"
+  if (( ROLLBACK )); then
+    ROLLBACK=0
+    warn "rolling back partial setup..."
+    stop_instance quiet
+  fi
+  exit 1
+}
+
+DRY_RUN=0
+shell_join() { local x out=""; for x in "$@"; do [[ $x =~ ^[A-Za-z0-9_./:=,@%+-]+$ ]] && out+="$x " || out+="$(printf '%q' "$x") "; done; echo "${out% }"; }
+run()  { # run a system-changing command (printed instead in --dry-run)
+  if (( DRY_RUN )); then printf '%s\n' "${D}+ $(shell_join "$@")${N}"; return 0; fi
+  "$@"
+}
+must() { run "$@" || die "command failed: $*"; }
+try()  { if (( DRY_RUN )); then run "$@"; else "$@" >/dev/null 2>&1 || true; fi; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ----------------------------------------------------------------------------
+# Configuration schema: VAR|yaml.path|type|default|description
+# types: str, int, bool, list (newline/space separated), clist (also commas)
+# ----------------------------------------------------------------------------
+declare -a S_VARS=()
+declare -A S_PATH=() S_TYPE=() S_DEF=() S_HELP=() PATH2VAR=()
+while IFS='|' read -r _v _p _t _d _h; do
+  [[ -z $_v || $_v == \#* ]] && continue
+  S_VARS+=("$_v"); S_PATH[$_v]=$_p; S_TYPE[$_v]=$_t; S_DEF[$_v]=$_d; S_HELP[$_v]=$_h; PATH2VAR[$_p]=$_v
+done <<'SCHEMA'
+NAME|name|str||Instance name (state dir + firewall table). Default: profile file name, else "default"
+DESCRIPTION|description|str||Free text shown by the `profiles` command
+LAN|lan|str||Client-side interface (Ethernet port, USB NIC, or Wi-Fi card for AP mode)
+WAN|wan|str|auto|Upstream interface to share; "auto" = default-route interface (can be a VPN, e.g. tun0)
+ADDRESS|address|str|192.168.50.1/24|Router address/prefix on the LAN
+DHCP_ENABLED|dhcp.enabled|bool|true|Serve DHCP on the LAN
+DHCP_RANGE|dhcp.range|str||Address pool "START-END" (default: .10 up to the last host)
+DHCP_LEASE|dhcp.lease|str|12h|Lease time (e.g. 30m, 12h, infinite)
+DHCP_RESERVATIONS|dhcp.reservations|list||Static leases "MAC,IP[,HOSTNAME]"
+DHCP_OPTIONS|dhcp.options|list||Raw dnsmasq dhcp-option values, e.g. "option:ntp-server,192.168.50.1"
+DHCP_PXE_TFTP_ROOT|dhcp.pxe.tftp_root|str||Enable the built-in TFTP server for this directory (PXE boot)
+DHCP_PXE_BOOT_FILE|dhcp.pxe.boot_file|str||Boot file offered to PXE clients (e.g. pxelinux.0, ipxe.efi)
+DNS_ENABLED|dns.enabled|bool|true|Run the caching DNS resolver (clients use the router as DNS)
+DNS_UPSTREAM|dns.upstream|clist|1.1.1.1,9.9.9.9|Upstream resolvers (IP or IP#port)
+DNS_DOMAIN|dns.domain|str|lan|Local domain: DHCP clients resolve as HOSTNAME.DOMAIN
+DNS_CACHE_SIZE|dns.cache_size|int|1000|Number of cached DNS entries
+DNS_LOG_QUERIES|dns.log_queries|bool|false|Log every DNS query and DHCP event (used by `logs` and `top`)
+DNS_RECORDS|dns.records|list||Local DNS records "NAME=IP"
+DNS_BLOCK_DOMAINS|dns.block_domains|clist||Domains (incl. subdomains) answered with NXDOMAIN
+DNS_BLOCKLIST_URLS|dns.blocklist_urls|list||Hosts-format or domain-list URLs downloaded at start (ads, malware...)
+DNS_BLOCKLIST_FILES|dns.blocklist_files|list||Local hosts-format or domain-list files
+DNS_FORCE|dns.force|bool|false|Hijack all LAN DNS (port 53) to the router, even hard-coded resolvers
+FIREWALL_ISOLATE_HOST|firewall.isolate_host|bool|false|Clients may reach this machine only for DHCP/DNS/TFTP/proxy
+FIREWALL_BLOCK_PRIVATE|firewall.block_private|bool|false|Clients get Internet only: no private/CGNAT/link-local nets, no other local interfaces
+FIREWALL_BLOCK_DOT|firewall.block_dot|bool|false|Block DNS-over-TLS/QUIC (port 853) so clients fall back to the router DNS
+FIREWALL_BLOCK_MACS|firewall.block_macs|clist||Client MACs denied DHCP and all traffic
+FIREWALL_PORT_FORWARDS|firewall.port_forwards|clist||WAN-to-LAN forwards "PROTO:WAN_PORT:LAN_IP[:LAN_PORT]"
+FIREWALL_TRANSPARENT_PROXY|firewall.transparent_proxy|int||Redirect client web traffic to this local port (Burp/mitmproxy transparent mode)
+FIREWALL_PROXY_PORTS|firewall.proxy_ports|str|80,443|Destination ports redirected to the transparent proxy
+SHAPING_DOWNLOAD|shaping.download|str||Cap total LAN download rate (e.g. 10mbit, 512kbit)
+SHAPING_UPLOAD|shaping.upload|str||Cap total LAN upload rate
+WIFI_SSID|wifi.ssid|str||Run an access point on LAN (must be Wi-Fi) with this SSID
+WIFI_PASSPHRASE|wifi.passphrase|str||WPA2 passphrase, 8-63 chars; empty = open network
+WIFI_BAND|wifi.band|str|g|g = 2.4 GHz, a = 5 GHz
+WIFI_CHANNEL|wifi.channel|int||Channel (default 6 for band g, 36 for band a)
+WIFI_COUNTRY|wifi.country|str|US|Regulatory country code
+WIFI_HIDDEN|wifi.hidden|bool|false|Hide the SSID
+CAPTURE_DIR|capture.dir|str|/var/tmp/chokepoint|Where pcaps and saved DNS logs are written
+HOOKS_POST_UP|hooks.post_up|str||Shell command run as root after start (env: CP_NAME CP_LAN CP_WAN CP_GW CP_NET CP_STATE)
+HOOKS_PRE_DOWN|hooks.pre_down|str||Shell command run as root before stop
+SCHEMA
+unset _v _p _t _d _h
+DERIVED_VARS=(GW PREFIX NET NETMASK RANGE_START RANGE_END TABLE IPT_CHAIN PREV_IP_FORWARD STARTED_AT PROFILE_SRC STATE_DIR)
+
+# CLI flag -> action:VAR   (set = replace, add = append to list, true/false = boolean)
+declare -A FLAGS=(
+  [--lan]=set:LAN [--wan]=set:WAN [-a]=set:ADDRESS [--address]=set:ADDRESS
+  [--description]=set:DESCRIPTION
+  [--dhcp-range]=set:DHCP_RANGE [--lease]=set:DHCP_LEASE [--no-dhcp]=false:DHCP_ENABLED
+  [--reserve]=add:DHCP_RESERVATIONS [--dhcp-option]=add:DHCP_OPTIONS
+  [--tftp-root]=set:DHCP_PXE_TFTP_ROOT [--boot-file]=set:DHCP_PXE_BOOT_FILE
+  [--dns]=add:DNS_UPSTREAM [--no-dns]=false:DNS_ENABLED [--domain]=set:DNS_DOMAIN
+  [--cache-size]=set:DNS_CACHE_SIZE [--log-queries]=true:DNS_LOG_QUERIES
+  [--record]=add:DNS_RECORDS [--block]=add:DNS_BLOCK_DOMAINS
+  [--blocklist-url]=add:DNS_BLOCKLIST_URLS [--blocklist-file]=add:DNS_BLOCKLIST_FILES
+  [--force-dns]=true:DNS_FORCE
+  [--isolate-host]=true:FIREWALL_ISOLATE_HOST [--block-private]=true:FIREWALL_BLOCK_PRIVATE
+  [--block-dot]=true:FIREWALL_BLOCK_DOT [--block-mac]=add:FIREWALL_BLOCK_MACS
+  [--forward]=add:FIREWALL_PORT_FORWARDS [--proxy]=set:FIREWALL_TRANSPARENT_PROXY
+  [--proxy-ports]=set:FIREWALL_PROXY_PORTS
+  [--rate-down]=set:SHAPING_DOWNLOAD [--rate-up]=set:SHAPING_UPLOAD
+  [--ssid]=set:WIFI_SSID [--passphrase]=set:WIFI_PASSPHRASE [--band]=set:WIFI_BAND
+  [--channel]=set:WIFI_CHANNEL [--country]=set:WIFI_COUNTRY [--hidden]=true:WIFI_HIDDEN
+  [--capture-dir]=set:CAPTURE_DIR [--post-up]=set:HOOKS_POST_UP [--pre-down]=set:HOOKS_PRE_DOWN
+)
+
+# ----------------------------------------------------------------------------
+# Small utilities
+# ----------------------------------------------------------------------------
+is_true()  { [[ ${1:-} == true ]]; }
+is_ipv4()  {
+  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local o; for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done
+}
+is_mac()   { [[ $1 =~ ^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$ ]]; }
+is_port()  { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+is_domain(){ [[ $1 =~ ^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9])?$ ]]; }
+is_rate()  { [[ $1 =~ ^[0-9]+(\.[0-9]+)?(bit|kbit|mbit|gbit)$ ]]; }
+iface_exists() { ip link show dev "$1" >/dev/null 2>&1; }
+iface_is_wifi() { [[ -d /sys/class/net/$1/wireless || -e /sys/class/net/$1/phy80211 ]]; }
+iface_ipv4() { ip -4 -o addr show dev "$1" 2>/dev/null | awk '{print $4}' | paste -sd' ' -; }
+default_iface() { ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
+items()  { [[ -n ${!1:-} ]] && printf '%s\n' "${!1}"; return 0; }   # print list var, one per line
+fmt_dur() {
+  local s=$1 out=""
+  (( s >= 86400 )) && { out+="$((s/86400))d"; s=$((s%86400)); }
+  (( s >= 3600 ))  && { out+="$((s/3600))h";  s=$((s%3600)); }
+  (( s >= 60 ))    && { out+="$((s/60))m";    s=$((s%60)); }
+  [[ -z $out ]] && out="${s}s"
+  echo "$out"
+}
+sanitize_name() { local n=${1,,}; n=${n//[^a-z0-9_-]/_}; echo "${n:0:32}"; }
+yaml_quote() { local s=${1//\'/\'\'}; printf "'%s'" "$s"; }
+list_instances() {
+  local d
+  for d in "$RUN_ROOT"/*/; do [[ -f $d/state.env ]] && basename "$d"; done 2>/dev/null
+  return 0
+}
+norm_list() { # $1=type $2=value -> clean newline-separated list
+  local v=$2 x
+  [[ $1 == clist ]] && v=${v//,/$'\n'}
+  local -a arr=()
+  read -r -d '' -a arr <<<"$v" || true
+  for x in "${arr[@]}"; do [[ -n $x ]] && printf '%s\n' "$x"; done
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# YAML loading (PyYAML if present, otherwise a built-in minimal parser)
+# ----------------------------------------------------------------------------
+declare -A CFG=()
+PROFILE_SRC=""
+
+find_profile() {
+  local p=$1 d f
+  if [[ -f $p ]]; then readlink -f "$p"; return 0; fi
+  for d in "${PROFILE_DIRS[@]}"; do
+    for f in "$d/$p.yml" "$d/$p.yaml" "$d/$p"; do
+      [[ -f $f ]] && { readlink -f "$f"; return 0; }
+    done
+  done
+  return 1
+}
+
+yaml_load() {
+  local file=$1 map="" v k val
+  have python3 || die "python3 is required to read YAML profiles"
+  for v in "${S_VARS[@]}"; do map+="${S_PATH[$v]}=$v"$'\n'; done
+  while IFS= read -r -d '' k && IFS= read -r -d '' val; do
+    case $k in
+      __WARN__) warn "$file: $val" ;;
+      __ERR__)  die "$file: $val" ;;
+      *)        CFG[$k]=$val ;;
+    esac
+  done < <(CP_MAP="$map" python3 -I - "$file" <<'PY'
+import os, sys
+path = sys.argv[1]
+mp = dict(l.split('=', 1) for l in os.environ['CP_MAP'].splitlines() if l)
+def emit(k, v): sys.stdout.write(k + '\0' + v + '\0')
+
+def unq(v):
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+        return v[1:-1]
+    return v
+def strip_comment(l):
+    out, q = [], None
+    for i, ch in enumerate(l):
+        if q:
+            if ch == q: q = None
+        elif ch in '"\'':
+            q = ch
+        elif ch == '#' and (i == 0 or l[i-1] in ' \t'):
+            break
+        out.append(ch)
+    return ''.join(out).rstrip()
+def inline(v):
+    v = v.strip()
+    if v.startswith('[') and v.endswith(']'):
+        return [unq(x) for x in v[1:-1].split(',') if x.strip()]
+    if v in ('{}',): return {}
+    return unq(v)
+def mini(text):
+    """Minimal YAML subset: nested mappings, block/inline lists, scalars, comments."""
+    root = {}
+    stack = [[-1, root]]
+    pending = None
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = strip_comment(raw)
+        s = line.strip()
+        if not s or s in ('---', '...'): continue
+        ind = len(line) - len(line.lstrip(' '))
+        item = s == '-' or s.startswith('- ')
+        if pending:
+            pind, pd, pk = pending; pending = None
+            if ind > pind or (item and ind == pind):
+                pd[pk] = [] if item else {}
+                stack.append([ind, pd[pk]])
+            else:
+                pd[pk] = ''
+        while len(stack) > 1 and (ind < stack[-1][0] or
+                                  (ind == stack[-1][0] and isinstance(stack[-1][1], list) and not item)):
+            stack.pop()
+        top = stack[-1][1]
+        if item:
+            if not isinstance(top, list): raise ValueError('line %d: unexpected list item' % n)
+            top.append(inline(s[1:]))
+        else:
+            if ':' not in s or not isinstance(top, dict): raise ValueError('line %d: cannot parse "%s"' % (n, s))
+            k, _, v = s.partition(':')
+            k = unq(k)
+            if v.strip() == '': pending = (ind, top, k)
+            else: top[k] = inline(v)
+    if pending: pending[1][pending[2]] = ''
+    return root
+
+try:
+    text = open(path, encoding='utf-8').read()
+except Exception as e:
+    emit('__ERR__', 'cannot read file: %s' % e); sys.exit(0)
+try:
+    try:
+        import yaml
+        # BaseLoader keeps every scalar a string: no 0x/sexagesimal/bool surprises with MACs etc.
+        data = yaml.load(text, Loader=yaml.BaseLoader)
+    except ImportError:
+        data = mini(text)
+except Exception as e:
+    emit('__ERR__', 'invalid YAML: %s' % e); sys.exit(0)
+if data in (None, ''): data = {}
+if not isinstance(data, dict):
+    emit('__ERR__', 'top level must be a mapping (key: value)'); sys.exit(0)
+def scalar(v):
+    if v is None: return ''
+    if isinstance(v, (dict, list)): raise ValueError
+    return str(v)
+def walk(d, prefix):
+    for k, v in d.items():
+        p = prefix + str(k)
+        if p in mp:
+            try:
+                if isinstance(v, list): emit(mp[p], '\n'.join(scalar(x) for x in v))
+                else: emit(mp[p], scalar(v))
+            except ValueError:
+                emit('__WARN__', "key '%s' has an unsupported nested value (ignored)" % p)
+        elif isinstance(v, dict):
+            walk(v, p + '.')
+        else:
+            emit('__WARN__', "unknown key '%s' (ignored)" % p)
+walk(data, '')
+PY
+)
+}
+
+# CLI overrides recorded during argument parsing, applied after YAML/env
+CLI_OPS=()   # entries: "op<TAB>VAR<TAB>value"
+cli_op() { CLI_OPS+=("$1"$'\t'"$2"$'\t'"$3"); }
+
+load_config() {
+  local p f v op var val
+  CFG=(); PROFILE_SRC=""
+  for p in "${PROFILES[@]}"; do
+    f=$(find_profile "$p") || die "profile '$p' not found (searched: ${PROFILE_DIRS[*]})"
+    yaml_load "$f"
+    PROFILE_SRC+="${PROFILE_SRC:+ }$f"
+  done
+  for v in "${S_VARS[@]}"; do   # environment layer: CP_<VAR>
+    local ev="CP_$v"
+    [[ -n ${!ev+x} ]] && CFG[$v]=${!ev}
+  done
+  for op in "${CLI_OPS[@]}"; do
+    IFS=$'\t' read -r op var val <<<"$op"
+    case $op in
+      set) CFG[$var]=$val ;;
+      add) if [[ -n ${CFG[$var]:-} ]]; then CFG[$var]+=$'\n'"$val"; else CFG[$var]=$val; fi ;;
+    esac
+  done
+}
+
+finalize_config() {
+  local v val t
+  for v in "${S_VARS[@]}"; do
+    if [[ -n ${CFG[$v]+x} ]]; then val=${CFG[$v]}; else val=${S_DEF[$v]}; fi
+    t=${S_TYPE[$v]}
+    case $t in
+      bool) case ${val,,} in
+              true|yes|on|1|y) val=true ;;
+              false|no|off|0|n|''|'~'|null) val=false ;;
+              *) die "${S_PATH[$v]}: '$val' is not a boolean (use true/false)" ;;
+            esac ;;
+      int)  [[ $val == '~' || $val == null ]] && val=''
+            [[ -z $val || $val =~ ^[0-9]+$ ]] || die "${S_PATH[$v]} must be a number, got '$val'" ;;
+      list|clist) val=$(norm_list "$t" "$val") ;;
+      str)  [[ $val == '~' || $val == null ]] && val='' ;;
+    esac
+    printf -v "$v" '%s' "$val"
+  done
+  if [[ -z $NAME ]]; then
+    if [[ -n $PROFILE_SRC ]]; then NAME=$(basename "${PROFILE_SRC%% *}"); NAME=${NAME%.*}; else NAME=default; fi
+  fi
+  NAME=$(sanitize_name "$NAME")
+  [[ -n $NAME ]] || NAME=default
+  [[ -z $WIFI_CHANNEL ]] && { [[ $WIFI_BAND == a ]] && WIFI_CHANNEL=36 || WIFI_CHANNEL=6; }
+  STATE_DIR=$RUN_ROOT/$NAME
+  TABLE=chokepoint_${NAME//-/_}
+}
+
+# Validate everything needed to start; computes GW/NET/range.
+validate_config() {
+  local x
+  [[ -n $LAN ]] || die "no LAN interface given. Use --lan IFACE or a profile (-p NAME). Try: $PROG check"
+  iface_exists "$LAN" || die "LAN interface '$LAN' does not exist (see: ip -br link)"
+  if [[ $(default_iface) == "$LAN" ]] && (( ! FORCE )); then
+    die "$LAN currently carries your default route - using it as LAN would cut your connectivity (--force to override)"
+  fi
+  if [[ -z $WAN || $WAN == auto ]]; then
+    WAN=$(default_iface)
+    [[ -n $WAN ]] || die "cannot auto-detect WAN (no default route); use --wan IFACE"
+  fi
+  iface_exists "$WAN" || die "WAN interface '$WAN' does not exist"
+  [[ $LAN != "$WAN" ]] || die "LAN and WAN are the same interface ($LAN)"
+  [[ -n $(iface_ipv4 "$WAN") ]] || warn "WAN $WAN has no IPv4 address yet - clients will have no Internet until it does"
+
+  # network math + overlap detection (python ipaddress)
+  have python3 || die "python3 is required"
+  local others="" dev cidr out
+  while read -r dev cidr; do
+    [[ $dev == "$LAN" || $dev == lo ]] && continue
+    others+="$dev=$cidr,"
+  done < <(ip -4 -o addr show 2>/dev/null | awk '{print $2, $4}')
+  # routes via other interfaces too (e.g. a VPN pushing the same subnet) - replies would leak into them
+  while read -r cidr dev; do
+    [[ $dev == "$LAN" ]] && continue
+    others+="$dev=$cidr,"
+  done < <(ip -4 route show table all 2>/dev/null | awk '$1 ~ /^[0-9]/ { for (i = 2; i < NF; i++) if ($i == "dev") { print $1, $(i+1); break } }')
+  out=$(python3 -I - "$ADDRESS" "$DHCP_RANGE" "$others" <<'PY'
+import ipaddress, re, sys
+addr, rng, others = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    if '/' not in addr: addr += '/24'
+    i = ipaddress.IPv4Interface(addr); n = i.network
+    if n.prefixlen > 30: raise ValueError('prefix /%d is too small for a LAN (max /30)' % n.prefixlen)
+    if i.ip in (n.network_address, n.broadcast_address):
+        raise ValueError('%s is the network/broadcast address of %s' % (i.ip, n))
+    if rng:
+        parts = re.split(r'\s*[-,]\s*', rng.strip())
+        if len(parts) != 2: raise ValueError('dhcp range must look like START-END')
+        s, e = (ipaddress.IPv4Address(p) for p in parts)
+        for x in (s, e):
+            if x not in n or x in (n.network_address, n.broadcast_address):
+                raise ValueError('dhcp range address %s is outside %s' % (x, n))
+        if int(s) > int(e): raise ValueError('dhcp range start is after end')
+    else:
+        s = n.network_address + (10 if n.num_addresses > 64 else 1)
+        e = n.broadcast_address - 1
+        if s == i.ip: s += 1
+        if e == i.ip: e -= 1
+    overlap = '-'
+    for o in filter(None, others.split(',')):
+        dev, cidr = o.split('=', 1)
+        if ipaddress.IPv4Interface(cidr).network.overlaps(n): overlap = dev + ':' + cidr; break
+    print('OK', i.ip, n.prefixlen, n, n.netmask, s, e, int(n.is_private), overlap)
+except Exception as ex:
+    print('ERR', ex)
+PY
+)
+  local status priv overlap
+  read -r status GW PREFIX NET NETMASK RANGE_START RANGE_END priv overlap <<<"$out"
+  [[ $status == OK ]] || die "address/range: ${out#ERR }"
+  [[ $overlap == - ]] || (( FORCE )) || die "LAN subnet $NET overlaps ${overlap#*:} on ${overlap%%:*} (address or route, e.g. pushed by a VPN) - replies would go there instead of $LAN. Pick another --address (--force to override)"
+  [[ $priv == 1 ]] || warn "$NET is NOT a private range - you are shadowing real Internet addresses (consider 192.168.x.x / 10.x.x.x)"
+
+  [[ $DNS_DOMAIN == '' ]] || is_domain "$DNS_DOMAIN" || die "dns.domain '$DNS_DOMAIN' is not a valid domain"
+  [[ $DHCP_LEASE =~ ^([0-9]+[smhdw]?|infinite)$ ]] || die "dhcp.lease '$DHCP_LEASE' is invalid (e.g. 30m, 12h, infinite)"
+  if is_true "$DNS_ENABLED"; then
+    [[ -n $DNS_UPSTREAM ]] || die "dns.upstream is empty"
+    while IFS= read -r x; do
+      [[ $x =~ ^([0-9.]+)(#[0-9]+)?$ ]] && is_ipv4 "${BASH_REMATCH[1]}" || die "dns upstream '$x' is not IPv4[#port]"
+    done < <(items DNS_UPSTREAM)
+  fi
+  while IFS= read -r x; do parse_reservation "$x" >/dev/null || die "invalid reservation '$x' (want MAC,IP[,HOSTNAME])"; done < <(items DHCP_RESERVATIONS)
+  while IFS= read -r x; do parse_record "$x" >/dev/null || die "invalid DNS record '$x' (want NAME=IP)"; done < <(items DNS_RECORDS)
+  while IFS= read -r x; do is_domain "${x#\*.}" || die "invalid domain to block '$x'"; done < <(items DNS_BLOCK_DOMAINS)
+  while IFS= read -r x; do is_mac "$x" || die "invalid MAC '$x'"; done < <(items FIREWALL_BLOCK_MACS)
+  while IFS= read -r x; do parse_forward "$x" >/dev/null || die "invalid port forward '$x' (want tcp|udp:WAN_PORT:LAN_IP[:LAN_PORT])"; done < <(items FIREWALL_PORT_FORWARDS)
+  while IFS= read -r x; do [[ -r $x ]] || die "blocklist file '$x' is not readable"; done < <(items DNS_BLOCKLIST_FILES)
+  if [[ -n $FIREWALL_TRANSPARENT_PROXY ]]; then
+    is_port "$FIREWALL_TRANSPARENT_PROXY" || die "transparent_proxy must be a port number"
+    for x in ${FIREWALL_PROXY_PORTS//,/ }; do is_port "$x" || die "proxy_ports: '$x' is not a port"; done
+  fi
+  for x in SHAPING_DOWNLOAD SHAPING_UPLOAD; do
+    [[ -z ${!x} ]] || is_rate "${!x}" || die "${S_PATH[$x]}: '${!x}' is not a rate (e.g. 512kbit, 20mbit)"
+  done
+  if [[ -n $DHCP_PXE_TFTP_ROOT ]]; then
+    [[ -d $DHCP_PXE_TFTP_ROOT ]] || die "tftp_root '$DHCP_PXE_TFTP_ROOT' is not a directory"
+    is_true "$DHCP_ENABLED" || warn "PXE needs DHCP enabled to advertise the boot file"
+  fi
+  if [[ -n $WIFI_SSID ]]; then
+    iface_is_wifi "$LAN" || die "wifi.ssid is set but $LAN is not a Wi-Fi interface"
+    [[ $WIFI_BAND == a || $WIFI_BAND == g ]] || die "wifi.band must be 'g' (2.4GHz) or 'a' (5GHz)"
+    (( ${#WIFI_SSID} <= 32 )) || die "SSID longer than 32 characters"
+    if [[ -n $WIFI_PASSPHRASE ]]; then
+      (( ${#WIFI_PASSPHRASE} >= 8 && ${#WIFI_PASSPHRASE} <= 63 )) || die "Wi-Fi passphrase must be 8-63 characters"
+    else
+      warn "no Wi-Fi passphrase: the access point will be OPEN"
+    fi
+  elif iface_is_wifi "$LAN"; then
+    warn "$LAN is a Wi-Fi interface but no SSID was given - set --ssid to run an access point"
+  fi
+  local inst
+  for inst in $(list_instances); do
+    [[ $inst == "$NAME" ]] && continue
+    grep -qx "LAN=$(printf '%q' "$LAN")" "$RUN_ROOT/$inst/state.env" 2>/dev/null \
+      && die "$LAN is already used by running instance '$inst'"
+  done
+  return 0
+}
+
+parse_reservation() { # MAC,IP[,NAME] -> "mac ip name"
+  local mac ip name rest
+  IFS=, read -r mac ip name rest <<<"$1"
+  is_mac "$mac" && is_ipv4 "$ip" && [[ -z $rest ]] || return 1
+  [[ -z $name ]] || is_domain "$name" || return 1
+  echo "${mac,,} $ip $name"
+}
+parse_record() { # NAME=IP -> "name ip"
+  local name=${1%%=*} ip=${1#*=}
+  [[ $1 == *=* ]] && is_domain "$name" && is_ipv4 "$ip" || return 1
+  echo "$name $ip"
+}
+parse_forward() { # proto:wport:ip[:lport] -> "proto wport ip lport"
+  local proto wport ip lport rest
+  IFS=: read -r proto wport ip lport rest <<<"$1"
+  proto=${proto,,}; lport=${lport:-$wport}
+  [[ ($proto == tcp || $proto == udp) && -z $rest ]] && is_port "$wport" && is_ipv4 "$ip" && is_port "$lport" || return 1
+  echo "$proto $wport $ip $lport"
+}
+
+# ----------------------------------------------------------------------------
+# State
+# ----------------------------------------------------------------------------
+write_state() {
+  local v f=$STATE_DIR/state.env
+  {
+    echo "# chokepoint state for '$NAME' - generated $(date '+%F %T'). Do not edit."
+    for v in "${S_VARS[@]}" "${DERIVED_VARS[@]}"; do printf '%s=%q\n' "$v" "${!v-}"; done
+  } >"$f"
+  chmod 600 "$f"
+}
+load_state() {
+  local f=$RUN_ROOT/$1/state.env
+  [[ -f $f && -O $f ]] || return 1
+  # shellcheck disable=SC1090
+  source "$f"
+}
+cfg_from_state() { local v; CFG=(); for v in "${S_VARS[@]}"; do CFG[$v]=${!v-}; done; }
+
+# Which instance does a runtime command target?
+resolve_name() {
+  if [[ -n $NAME_OPT ]]; then NAME=$(sanitize_name "$NAME_OPT"); return; fi
+  if (( ${#PROFILES[@]} )); then load_config; finalize_config; return; fi
+  local -a running=()
+  mapfile -t running < <(list_instances)
+  case ${#running[@]} in
+    0) NAME=default ;;
+    1) NAME=${running[0]} ;;
+    *) die "several routers are running (${running[*]}) - choose one with -n NAME" ;;
+  esac
+}
+require_running() {
+  resolve_name
+  load_state "$NAME" || die "router '$NAME' is not running (running: $(list_instances | paste -sd' ' - | sed 's/^$/none/'))"
+}
+
+need_root() {
+  (( EUID == 0 || DRY_RUN )) && return 0
+  have sudo || die "this command needs root privileges"
+  local -a envs=() e
+  for e in $(compgen -e); do [[ $e == CP_* || $e == NO_COLOR || $e == CHOKEPOINT_PROFILES ]] && envs+=("$e=${!e}"); done
+  exec sudo -- env "${envs[@]}" "$SCRIPT_PATH" "${ORIG_ARGS[@]}"
+}
+
+# ----------------------------------------------------------------------------
+# Data files (live-editable, re-read by dnsmasq on SIGHUP)
+# ----------------------------------------------------------------------------
+# source lists:  records  blocked_domains  reservations  blocked_macs  forwards
+# generated:     hosts    blocked.conf     dhcp-hosts    (+ nft set / chain)
+gen_hosts() {
+  local name ip
+  {
+    echo "$GW router${DNS_DOMAIN:+ router.$DNS_DOMAIN}"
+    while read -r name ip; do
+      [[ -z $name ]] && continue
+      if [[ $name == *.* || -z $DNS_DOMAIN ]]; then echo "$ip $name"; else echo "$ip $name $name.$DNS_DOMAIN"; fi
+    done < <(while IFS= read -r l; do parse_record "$l"; done <"$STATE_DIR/records")
+  } >"$STATE_DIR/hosts"
+}
+gen_servers() { sed -e 's/^\*\.//' -e '/^$/d' -e 's|.*|server=/&/|' "$STATE_DIR/blocked_domains" >"$STATE_DIR/blocked.conf"; }
+gen_dhcp_hosts() {
+  local mac ip name
+  {
+    while read -r mac ip name; do
+      [[ -n $mac ]] && echo "$mac,$ip${name:+,$name}"
+    done < <(while IFS= read -r l; do parse_reservation "$l"; done <"$STATE_DIR/reservations")
+    sed -e '/^$/d' -e 's/$/,ignore/' "$STATE_DIR/blocked_macs"
+  } >"$STATE_DIR/dhcp-hosts"
+}
+build_blocklists() {
+  local out=$STATE_DIR/blocklists.hosts tmp src n
+  : >"$out"
+  tmp=$(mktemp)
+  while IFS= read -r src; do cat -- "$src" >>"$tmp" 2>/dev/null || warn "cannot read blocklist $src"; echo >>"$tmp"; done < <(items DNS_BLOCKLIST_FILES)
+  while IFS= read -r src; do
+    step "Downloading blocklist $src"
+    if have curl; then curl -fsSL --max-time 60 "$src" >>"$tmp" || warn "download failed: $src"
+    elif have wget; then wget -qO- --timeout=60 "$src" >>"$tmp" || warn "download failed: $src"
+    else warn "neither curl nor wget available - skipping $src"; fi
+    echo >>"$tmp"
+  done < <(items DNS_BLOCKLIST_URLS)
+  # accept hosts format, plain domain lists and adblock "||domain^" lines
+  awk '{ sub(/\r$/,""); sub(/#.*/,""); }
+       NF==0 { next }
+       $1 ~ /^\|\|[^\/]+\^$/ { d=$1; gsub(/^\|\||\^$/,"",d); print "0.0.0.0 " tolower(d); next }
+       NF>=2 && $1 ~ /^(0\.0\.0\.0|127\.0\.0\.1|::1?|::)$/ {
+         for (i=2;i<=NF;i++) if ($i !~ /^(localhost(\.localdomain)?|local|broadcasthost|ip6-.*|0\.0\.0\.0)$/) print "0.0.0.0 " tolower($i); next }
+       NF==1 && $1 ~ /^[A-Za-z0-9_.-]+\.[A-Za-z0-9-]+$/ { print "0.0.0.0 " tolower($1) }' "$tmp" | sort -u >"$out"
+  rm -f "$tmp"
+  n=$(wc -l <"$out")
+  (( n > 0 )) && ok "Blocklists: $n domains"
+  return 0
+}
+init_data_files() {
+  items DNS_RECORDS >"$STATE_DIR/records"
+  items DNS_BLOCK_DOMAINS >"$STATE_DIR/blocked_domains"
+  items DHCP_RESERVATIONS | awk -F, -v OFS=, '{ $1 = tolower($1); print }' >"$STATE_DIR/reservations"
+  items FIREWALL_BLOCK_MACS | tr 'A-F' 'a-f' >"$STATE_DIR/blocked_macs"
+  items FIREWALL_PORT_FORWARDS >"$STATE_DIR/forwards"
+  gen_hosts; gen_servers; gen_dhcp_hosts; build_blocklists
+  chmod 644 "$STATE_DIR"/{records,blocked_domains,reservations,blocked_macs,forwards,hosts,blocked.conf,dhcp-hosts,blocklists.hosts}
+}
+reload_dnsmasq() {
+  local pid
+  pid=$(cat "$STATE_DIR/dnsmasq.pid" 2>/dev/null) || return 0
+  kill -0 "$pid" 2>/dev/null && run kill -HUP "$pid"
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Firewall (nftables) + compatibility rules for Docker / UFW iptables policies
+# ----------------------------------------------------------------------------
+nft_exec() {
+  if (( DRY_RUN )); then printf '%s\n' "${D}+ nft -f - <<EOF" "$1" "EOF${N}"; return 0; fi
+  nft -f - <<<"$1"
+}
+build_ruleset() {
+  local in_udp="53, 67" in_tcp="53" pports=${FIREWALL_PROXY_PORTS//,/, }
+  [[ -n $DHCP_PXE_TFTP_ROOT ]] && in_udp+=", 69"
+  [[ -n $FIREWALL_TRANSPARENT_PROXY ]] && in_tcp+=", $FIREWALL_TRANSPARENT_PROXY"
+  cat <<EOF
+table ip $TABLE {
+  set blocked_macs { type ether_addr; }
+  set private_nets {
+    type ipv4_addr; flags interval;
+    elements = { 10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 }
+  }
+  chain port_forwards { }
+  chain input {
+    type filter hook input priority -5; policy accept;
+    iifname "$LAN" ether saddr @blocked_macs counter drop
+EOF
+  if is_true "$FIREWALL_ISOLATE_HOST"; then cat <<EOF
+    iifname "$LAN" ct state established,related accept
+    iifname "$LAN" meta l4proto icmp accept
+    iifname "$LAN" udp dport { $in_udp } accept
+    iifname "$LAN" tcp dport { $in_tcp } accept
+    iifname "$LAN" counter drop comment "isolate_host"
+EOF
+  fi
+  cat <<EOF
+  }
+  chain forward {
+    type filter hook forward priority -5; policy accept;
+    iifname "$LAN" ether saddr @blocked_macs counter drop
+    ct state established,related accept
+    ct status dnat accept
+EOF
+  is_true "$FIREWALL_BLOCK_DOT" && cat <<EOF
+    iifname "$LAN" tcp dport 853 counter reject with tcp reset comment "block_dot"
+    iifname "$LAN" udp dport 853 counter drop comment "block_dot"
+EOF
+  is_true "$FIREWALL_BLOCK_PRIVATE" && cat <<EOF
+    iifname "$LAN" ip daddr @private_nets counter drop comment "block_private"
+    iifname "$LAN" oifname != "$WAN" counter drop comment "block_private"
+EOF
+  cat <<EOF
+    iifname "$LAN" oifname "$WAN" counter accept
+    iifname "$WAN" oifname "$LAN" counter drop
+  }
+  chain prerouting {
+    type nat hook prerouting priority -100; policy accept;
+    jump port_forwards
+EOF
+  is_true "$DNS_FORCE" && is_true "$DNS_ENABLED" && cat <<EOF
+    iifname "$LAN" ip daddr != $GW udp dport 53 counter redirect to :53 comment "force_dns"
+    iifname "$LAN" ip daddr != $GW tcp dport 53 counter redirect to :53 comment "force_dns"
+EOF
+  [[ -n $FIREWALL_TRANSPARENT_PROXY ]] && cat <<EOF
+    iifname "$LAN" ip daddr != $GW tcp dport { $pports } counter redirect to :$FIREWALL_TRANSPARENT_PROXY comment "transparent_proxy"
+EOF
+  cat <<EOF
+  }
+  chain postrouting {
+    type nat hook postrouting priority 100; policy accept;
+    oifname "$WAN" ip saddr $NET counter masquerade
+  }
+}
+EOF
+}
+nft_sync_forwards() {
+  local script="flush chain ip $TABLE port_forwards"$'\n' proto wport ip lport l
+  while IFS= read -r l; do
+    read -r proto wport ip lport < <(parse_forward "$l") || continue
+    script+="add rule ip $TABLE port_forwards iifname \"$WAN\" $proto dport $wport counter dnat to $ip:$lport"$'\n'
+  done <"$STATE_DIR/forwards"
+  nft_exec "$script"
+}
+nft_sync_macs() {
+  local script="flush set ip $TABLE blocked_macs"$'\n' macs
+  macs=$(sed '/^$/d' "$STATE_DIR/blocked_macs" | paste -sd, -)
+  [[ -n $macs ]] && script+="add element ip $TABLE blocked_macs { $macs }"$'\n'
+  nft_exec "$script"
+}
+
+ipt_rules() { # iptables rules so Docker's / UFW's DROP policies don't block us
+  local udp="53,67"
+  [[ -n $DHCP_PXE_TFTP_ROOT ]] && udp+=",69"
+  echo "$IPT_CHAIN -i $LAN -o $WAN -j ACCEPT"
+  echo "$IPT_CHAIN -i $WAN -o $LAN -m conntrack --ctstate ESTABLISHED,RELATED,DNAT -j ACCEPT"
+  echo "INPUT -i $LAN -p udp -m multiport --dports $udp -j ACCEPT"
+  echo "INPUT -i $LAN -p tcp --dport 53 -j ACCEPT"
+  [[ -n $FIREWALL_TRANSPARENT_PROXY ]] && echo "INPUT -i $LAN -p tcp --dport $FIREWALL_TRANSPARENT_PROXY -j ACCEPT"
+  return 0
+}
+ipt_apply() {
+  have iptables || return 0
+  local r; local -a a
+  while IFS= read -r r; do
+    read -ra a <<<"$r"
+    iptables -C "${a[@]}" 2>/dev/null || run iptables -I "${a[@]}" || warn "iptables rule failed: $r"
+  done < <(ipt_rules)
+}
+ipt_remove() {
+  have iptables && [[ -n ${IPT_CHAIN:-} ]] || return 0
+  local r i; local -a a
+  while IFS= read -r r; do
+    read -ra a <<<"$r"
+    if (( DRY_RUN )); then run iptables -D "${a[@]}"; continue; fi
+    for i in 1 2 3 4 5; do iptables -C "${a[@]}" 2>/dev/null || break; iptables -D "${a[@]}"; done
+  done < <(ipt_rules)
+}
+
+# ----------------------------------------------------------------------------
+# Services
+# ----------------------------------------------------------------------------
+dnsmasq_user() { id -u dnsmasq >/dev/null 2>&1 && echo dnsmasq || echo nobody; }
+
+start_dnsmasq() {
+  is_true "$DNS_ENABLED" || is_true "$DHCP_ENABLED" || return 0
+  local S=$STATE_DIR u o
+  local -a a=(--conf-file=/dev/null --pid-file="$S/dnsmasq.pid" --interface="$LAN"
+              --bind-interfaces --except-interface=lo --no-hosts)
+  if is_true "$DNS_ENABLED"; then
+    a+=(--no-resolv --domain-needed --bogus-priv --cache-size="$DNS_CACHE_SIZE"
+        --addn-hosts="$S/hosts" --addn-hosts="$S/blocklists.hosts" --servers-file="$S/blocked.conf")
+    while IFS= read -r u; do a+=(--server="$u"); done < <(items DNS_UPSTREAM)
+    [[ -n $DNS_DOMAIN ]] && a+=(--domain="$DNS_DOMAIN" --local="/$DNS_DOMAIN/" --expand-hosts)
+  else
+    a+=(--port=0)
+  fi
+  if is_true "$DNS_LOG_QUERIES"; then
+    a+=(--log-queries --log-dhcp --log-facility="$S/dns.log")
+    if (( ! DRY_RUN )); then touch "$S/dns.log"; chown "$(dnsmasq_user)" "$S/dns.log" 2>/dev/null; chmod 640 "$S/dns.log"; fi
+  fi
+  if is_true "$DHCP_ENABLED"; then
+    # restore leases from the previous run of this instance (restart / stop+start)
+    (( ! DRY_RUN )) && [[ -s $RUN_ROOT/.$NAME.leases && ! -e $S/dnsmasq.leases ]] && mv "$RUN_ROOT/.$NAME.leases" "$S/dnsmasq.leases"
+    a+=(--dhcp-range="$RANGE_START,$RANGE_END,$NETMASK,$DHCP_LEASE" --dhcp-authoritative
+        --dhcp-option=option:router,"$GW" --dhcp-leasefile="$S/dnsmasq.leases" --dhcp-hostsfile="$S/dhcp-hosts")
+    if is_true "$DNS_ENABLED"; then a+=(--dhcp-option=option:dns-server,"$GW")
+    else a+=(--dhcp-option=option:dns-server,"$(items DNS_UPSTREAM | sed 's/#.*//' | paste -sd, -)"); fi
+    while IFS= read -r o; do a+=(--dhcp-option="$o"); done < <(items DHCP_OPTIONS)
+    [[ -n $DHCP_PXE_BOOT_FILE ]] && a+=(--dhcp-boot="$DHCP_PXE_BOOT_FILE${DHCP_PXE_TFTP_ROOT:+,router,$GW}")
+  fi
+  [[ -n $DHCP_PXE_TFTP_ROOT ]] && a+=(--enable-tftp --tftp-root="$DHCP_PXE_TFTP_ROOT")
+  local what=()
+  is_true "$DHCP_ENABLED" && what+=(DHCP)
+  is_true "$DNS_ENABLED" && what+=(DNS)
+  [[ -n $DHCP_PXE_TFTP_ROOT ]] && what+=(TFTP)
+  step "Starting dnsmasq (${what[*]})"
+  must dnsmasq "${a[@]}"
+}
+
+start_hostapd() {
+  [[ -n $WIFI_SSID ]] || return 0
+  local f=$STATE_DIR/hostapd.conf
+  have rfkill && try rfkill unblock wlan
+  (
+    umask 077
+    cat >"$f" <<EOF
+interface=$LAN
+driver=nl80211
+ctrl_interface=$STATE_DIR/hostapd-ctrl
+ssid=$WIFI_SSID
+hw_mode=$WIFI_BAND
+channel=$WIFI_CHANNEL
+country_code=$WIFI_COUNTRY
+ieee80211d=1
+ieee80211n=1
+wmm_enabled=1
+auth_algs=1
+ignore_broadcast_ssid=$(is_true "$WIFI_HIDDEN" && echo 1 || echo 0)
+EOF
+    [[ $WIFI_BAND == a ]] && echo "ieee80211ac=1" >>"$f"
+    [[ -n $WIFI_PASSPHRASE ]] && cat >>"$f" <<EOF
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=$WIFI_PASSPHRASE
+EOF
+  )
+  step "Starting access point '$WIFI_SSID' on $LAN (band $WIFI_BAND, channel $WIFI_CHANNEL)"
+  must hostapd -B -P "$STATE_DIR/hostapd.pid" -f "$STATE_DIR/hostapd.log" "$f"
+}
+
+apply_shaping() {
+  [[ -n $SHAPING_DOWNLOAD || -n $SHAPING_UPLOAD ]] || return 0
+  have tc || die "tc (iproute2) is required for shaping"
+  if [[ -n $SHAPING_DOWNLOAD ]]; then
+    step "Limiting download to $SHAPING_DOWNLOAD"
+    must tc qdisc replace dev "$LAN" root handle 1: htb default 10
+    must tc class replace dev "$LAN" parent 1: classid 1:10 htb rate "$SHAPING_DOWNLOAD" ceil "$SHAPING_DOWNLOAD"
+    try tc qdisc replace dev "$LAN" parent 1:10 fq_codel
+  fi
+  if [[ -n $SHAPING_UPLOAD ]]; then
+    step "Limiting upload to $SHAPING_UPLOAD"
+    try tc qdisc del dev "$LAN" ingress
+    must tc qdisc add dev "$LAN" handle ffff: ingress
+    must tc filter add dev "$LAN" parent ffff: protocol ip u32 match u32 0 0 police rate "$SHAPING_UPLOAD" burst 256k drop flowid :1
+  fi
+}
+
+run_hook() {
+  local which=$1 cmd=$2
+  [[ -n $cmd ]] || return 0
+  step "Running $which hook"
+  if (( DRY_RUN )); then run bash -c "$cmd"; return 0; fi
+  CP_NAME=$NAME CP_LAN=$LAN CP_WAN=$WAN CP_GW=$GW CP_NET=$NET CP_STATE=$STATE_DIR \
+    bash -c "$cmd" || warn "$which hook exited with status $?"
+}
+
+kill_pidfile() { # file expected-comm
+  local f=$STATE_DIR/$1 pid i
+  [[ -f $f ]] || return 0
+  pid=$(<"$f")
+  if [[ $pid =~ ^[0-9]+$ ]] && [[ $(cat "/proc/$pid/comm" 2>/dev/null) == "$2" ]]; then
+    run kill "$pid"
+    (( DRY_RUN )) || for i in {1..30}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    kill -0 "$pid" 2>/dev/null && (( ! DRY_RUN )) && kill -9 "$pid"
+  fi
+  (( DRY_RUN )) || rm -f "$f"
+}
+
+# ----------------------------------------------------------------------------
+# start / stop
+# ----------------------------------------------------------------------------
+config_for_start() {
+  # No profile and no --lan: fall back to the "default" profile if one exists.
+  local has_lan=0 op
+  for op in "${CLI_OPS[@]}"; do [[ $op == set$'\t'LAN$'\t'* ]] && has_lan=1; done
+  if (( ${#PROFILES[@]} == 0 && ! has_lan )) && [[ -z ${CP_LAN:-} ]] && find_profile default >/dev/null; then
+    PROFILES=(default)
+    info "No profile/--lan given: using profile 'default' ($(find_profile default))"
+  fi
+  load_config
+  finalize_config
+}
+
+cmd_start() {
+  if (( ! ${REUSE_STATE:-0} )); then config_for_start; fi
+  validate_config
+  [[ -f $STATE_DIR/state.env ]] && (( ! DRY_RUN )) && die "router '$NAME' is already running (use: $PROG restart -n $NAME)"
+  have nft || die "nft (nftables) is required"
+  { is_true "$DNS_ENABLED" || is_true "$DHCP_ENABLED"; } && ! have dnsmasq && die "dnsmasq is required (apt install dnsmasq-base)"
+  [[ -n $WIFI_SSID ]] && ! have hostapd && die "hostapd is required for access-point mode (apt install hostapd)"
+
+  if (( DRY_RUN )); then
+    STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/chokepoint-dryrun.XXXXXX")
+    info "${B}DRY RUN${N} - nothing will be changed. Rendered files: $STATE_DIR"
+  fi
+  IPT_CHAIN=FORWARD
+  have iptables && iptables -nL DOCKER-USER >/dev/null 2>&1 && IPT_CHAIN=DOCKER-USER
+  PREV_IP_FORWARD=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 1)
+  STARTED_AT=$(date +%s)
+  install -d -m 755 "$STATE_DIR"
+  write_state
+  (( DRY_RUN )) || ROLLBACK=1
+
+  step "Configuring $LAN as $GW/$PREFIX"
+  if have nmcli; then
+    try nmcli device set "$LAN" managed no
+  fi
+  must ip addr flush dev "$LAN"
+  must ip addr add "$GW/$PREFIX" dev "$LAN"
+  must ip link set "$LAN" up
+  must sysctl -qw net.ipv4.ip_forward=1
+
+  init_data_files
+  step "Loading firewall/NAT table '$TABLE'"
+  try nft delete table ip "$TABLE"
+  nft_exec "$(build_ruleset)" || die "loading nftables rules failed"
+  nft_sync_forwards || die "loading port forwards failed"
+  nft_sync_macs || die "loading blocked MACs failed"
+  ipt_apply
+  apply_shaping
+  start_hostapd
+  start_dnsmasq
+  ROLLBACK=0
+  run_hook post_up "$HOOKS_POST_UP"
+  echo
+  if (( DRY_RUN )); then ok "Dry run complete."; else ok "${B}Router '$NAME' is up${N}"; fi
+  show_instance
+  (( DRY_RUN )) || printf '%s\n' "  ${D}Next: $PROG status | clients | logs -f | top | capture | stop -n $NAME${N}"
+}
+
+stop_instance() {
+  local quiet=${1:-}
+  [[ -n $quiet ]] || run_hook pre_down "${HOOKS_PRE_DOWN:-}"
+  kill_pidfile dnsmasq.pid dnsmasq
+  kill_pidfile hostapd.pid hostapd
+  ipt_remove
+  try nft delete table ip "$TABLE"
+  if [[ -n ${SHAPING_DOWNLOAD:-} ]]; then try tc qdisc del dev "$LAN" root; fi
+  if [[ -n ${SHAPING_UPLOAD:-} ]]; then try tc qdisc del dev "$LAN" ingress; fi
+  try ip addr flush dev "$LAN"
+  have nmcli && try nmcli device set "$LAN" managed yes
+  # restore ip_forward only if it was off, no other router runs, and Docker doesn't need it
+  if [[ ${PREV_IP_FORWARD:-1} == 0 ]] && ! iface_exists docker0 && [[ -z $(list_instances | grep -vx "$NAME") ]]; then
+    try sysctl -qw net.ipv4.ip_forward=0
+  fi
+  if [[ -s $STATE_DIR/dns.log ]] && (( ! DRY_RUN )); then
+    install -d -m 755 "$CAPTURE_DIR" 2>/dev/null && {
+      local keep="$CAPTURE_DIR/dns-$NAME-$(date +%Y%m%d-%H%M%S).log"
+      cp "$STATE_DIR/dns.log" "$keep" && chown "$REAL_USER" "$keep" 2>/dev/null
+      [[ -n $quiet ]] || info "DNS log saved to $keep"
+    }
+  fi
+  if (( ! DRY_RUN )) && [[ $STATE_DIR == "$RUN_ROOT"/* ]]; then
+    [[ -s $STATE_DIR/dnsmasq.leases ]] && cp "$STATE_DIR/dnsmasq.leases" "$RUN_ROOT/.$NAME.leases"
+    rm -rf -- "$STATE_DIR"
+  fi
+}
+
+cmd_stop() {
+  resolve_name
+  if load_state "$NAME"; then
+    step "Stopping router '$NAME'"
+    stop_instance
+    ok "Router '$NAME' is down"
+    return
+  fi
+  die "router '$NAME' is not running"
+}
+
+cmd_restart() {
+  resolve_name
+  if load_state "$NAME"; then
+    local op new_cfg=0
+    for op in "${CLI_OPS[@]}"; do [[ $op == set$'\t'NAME$'\t'* ]] || new_cfg=1; done
+    if (( ${#PROFILES[@]} == 0 && ! new_cfg )); then
+      info "Re-using the configuration router '$NAME' was started with"
+      cfg_from_state; REUSE_STATE=1
+    fi
+    step "Stopping router '$NAME'"
+    stop_instance
+  fi
+  if (( REUSE_STATE )); then finalize_config; fi
+  cmd_start
+}
+
+# ----------------------------------------------------------------------------
+# Observability
+# ----------------------------------------------------------------------------
+dnsmasq_alive() { local p; p=$(cat "$STATE_DIR/dnsmasq.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null; }
+hostapd_alive() { local p; p=$(cat "$STATE_DIR/hostapd.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null; }
+lease_count() { [[ -f $STATE_DIR/dnsmasq.leases ]] && wc -l <"$STATE_DIR/dnsmasq.leases" || echo 0; }
+list_file_count() { [[ -f $STATE_DIR/$1 ]] && sed '/^$/d' "$STATE_DIR/$1" | wc -l || echo 0; }
+
+show_instance() {
+  local feats=() up=""
+  is_true "$FIREWALL_ISOLATE_HOST" && feats+=(isolate-host)
+  is_true "$FIREWALL_BLOCK_PRIVATE" && feats+=(block-private)
+  is_true "$FIREWALL_BLOCK_DOT" && feats+=(block-DoT)
+  is_true "$DNS_FORCE" && feats+=(force-dns)
+  [[ -n $FIREWALL_TRANSPARENT_PROXY ]] && feats+=("proxy→:$FIREWALL_TRANSPARENT_PROXY (ports $FIREWALL_PROXY_PORTS)")
+  feats+=("$(list_file_count forwards) port-forwards" "$(list_file_count blocked_macs) blocked MACs")
+  (( DRY_RUN )) || up=" ${D}up $(fmt_dur $(( $(date +%s) - STARTED_AT )))${N}"
+  printf '  %s●%s %s%s%s%s  %s\n' "$G" "$N" "$B" "$NAME" "$N" "$up" "${DESCRIPTION:+${D}$DESCRIPTION${N}}"
+  printf '    %-7s %s %s → WAN %s %s\n' "LAN" "$LAN" "$GW/$PREFIX" "$WAN" "${D}($(iface_ipv4 "$WAN"))${N}"
+  if is_true "$DHCP_ENABLED"; then
+    printf '    %-7s %s – %s, lease %s, %s active, %s reserved%s\n' DHCP "$RANGE_START" "$RANGE_END" "$DHCP_LEASE" \
+      "$(lease_count)" "$(list_file_count reservations)" "${DHCP_PXE_BOOT_FILE:+, PXE $DHCP_PXE_BOOT_FILE}"
+  else printf '    %-7s off\n' DHCP; fi
+  if is_true "$DNS_ENABLED"; then
+    printf '    %-7s %s → %s · .%s · %s blocked domains · %s blocklist entries · log %s\n' DNS "$GW" \
+      "$(items DNS_UPSTREAM | paste -sd' ' -)" "${DNS_DOMAIN:-none}" "$(list_file_count blocked_domains)" \
+      "$(list_file_count blocklists.hosts)" "$(is_true "$DNS_LOG_QUERIES" && echo on || echo off)"
+  else printf '    %-7s off\n' DNS; fi
+  printf '    %-7s %s\n' Filter "$(IFS=,; echo "${feats[*]}" | sed 's/,/ · /g')"
+  [[ -n $SHAPING_DOWNLOAD$SHAPING_UPLOAD ]] && printf '    %-7s down %s / up %s\n' Shaping "${SHAPING_DOWNLOAD:-∞}" "${SHAPING_UPLOAD:-∞}"
+  [[ -n $WIFI_SSID ]] && printf '    %-7s SSID "%s" %s, band %s ch %s%s\n' Wi-Fi "$WIFI_SSID" \
+      "$([[ -n $WIFI_PASSPHRASE ]] && echo WPA2 || echo OPEN)" "$WIFI_BAND" "$WIFI_CHANNEL" \
+      "$( (( DRY_RUN )) || { hostapd_alive && echo " (hostapd up)" || echo " ${R}(hostapd DOWN)${N}"; })"
+  if (( ! DRY_RUN )); then
+    if is_true "$DNS_ENABLED" || is_true "$DHCP_ENABLED"; then
+      dnsmasq_alive && printf '    %-7s dnsmasq pid %s\n' Procs "$(<"$STATE_DIR/dnsmasq.pid")" \
+                    || printf '    %-7s %sdnsmasq is NOT running%s\n' Procs "$R" "$N"
+    fi
+  fi
+  [[ -n $PROFILE_SRC ]] && printf '    %-7s %s\n' Profile "${D}$PROFILE_SRC${N}"
+  return 0
+}
+
+cmd_status() {
+  local -a names=() n
+  if [[ -n $NAME_OPT || ${#PROFILES[@]} -gt 0 ]]; then resolve_name; names=("$NAME"); else mapfile -t names < <(list_instances); fi
+  if (( ${#names[@]} == 0 )); then
+    info "No router is running."
+    return 0
+  fi
+  for n in "${names[@]}"; do
+    load_state "$n" || { warn "router '$n' is not running"; continue; }
+    show_instance; echo
+  done
+}
+
+print_leases() {
+  local now exp mac ip host left f=$STATE_DIR/dnsmasq.leases
+  now=$(date +%s)
+  printf "${B}%-16s %-18s %-24s %s${N}\n" IP MAC HOSTNAME EXPIRES
+  [[ -s $f ]] || { echo "  (no leases yet)"; return 0; }
+  sort -k3,3V "$f" 2>/dev/null | while read -r exp mac ip host _; do
+    if (( exp == 0 )); then left=never; else left="in $(fmt_dur $(( exp > now ? exp - now : 0 )))"; fi
+    printf '%-16s %-18s %-24s %s\n' "$ip" "$mac" "${host/\*/-}" "$left"
+  done
+}
+cmd_leases() { require_running; print_leases; }
+
+cmd_clients() {
+  require_running
+  local ip mac state host flags
+  declare -A names=() reserved=() blocked=()
+  if [[ -f $STATE_DIR/dnsmasq.leases ]]; then
+    while read -r _ mac ip host _; do names[$ip]=$host; done <"$STATE_DIR/dnsmasq.leases"
+  fi
+  while read -r mac ip host; do [[ -n $mac ]] && { reserved[$mac]=1; [[ -n $host ]] && names[$ip]=${names[$ip]:-$host}; }; done \
+    < <(while IFS= read -r l; do parse_reservation "$l"; done <"$STATE_DIR/reservations")
+  while IFS= read -r mac; do [[ -n $mac ]] && blocked[$mac]=1; done <"$STATE_DIR/blocked_macs"
+  printf "${B}%-16s %-18s %-22s %-11s %s${N}\n" IP MAC HOSTNAME STATE FLAGS
+  ip -4 neigh show dev "$LAN" | while read -r ip f2 mac state; do
+    [[ $f2 == lladdr ]] || { state=$f2; mac='-'; }
+    flags=""
+    [[ -n ${reserved[$mac]:-} ]] && flags+="reserved "
+    [[ -n ${blocked[$mac]:-} ]] && flags+="${R}BLOCKED${N} "
+    host=${names[$ip]:--}; host=${host/\*/-}
+    printf '%-16s %-18s %-22s %-11s %s\n' "$ip" "$mac" "$host" "${state:-?}" "$flags"
+  done
+  echo; echo "${D}Neighbours seen on $LAN. Use '$PROG scan' for an active sweep, '$PROG leases' for DHCP.${N}"
+}
+
+cmd_logs() {
+  require_running
+  local -a f=(-n "${POS[0]:-50}")
+  (( FOLLOW )) && f+=(-f)
+  local files=()
+  [[ -f $STATE_DIR/dns.log ]] && files+=("$STATE_DIR/dns.log")
+  [[ -f $STATE_DIR/hostapd.log ]] && files+=("$STATE_DIR/hostapd.log")
+  if (( ${#files[@]} )); then exec tail "${f[@]}" "${files[@]}"; fi
+  info "Query logging is off (enable with --log-queries); showing dnsmasq's journal instead."
+  local pid; pid=$(cat "$STATE_DIR/dnsmasq.pid" 2>/dev/null)
+  have journalctl || die "journalctl not available"
+  exec journalctl "${f[@]}" ${pid:+_PID=$pid}
+}
+
+cmd_top() {
+  require_running
+  local f=$STATE_DIR/dns.log n=${POS[0]:-15}
+  [[ $n =~ ^[0-9]+$ ]] || die "usage: $PROG top [N]"
+  [[ -s $f ]] || die "no DNS log yet (start with --log-queries or dns.log_queries: true)"
+  local leases=$STATE_DIR/dnsmasq.leases; [[ -f $leases ]] || leases=/dev/null
+  echo "${B}Top $n queried domains${N}"
+  awk 'match($0, /query\[[A-Za-z0-9]+\] [^ ]+ from /) { split(substr($0,RSTART,RLENGTH),a," "); print a[2] }' "$f" \
+    | sort | uniq -c | sort -rn | head -n "$n"
+  echo; echo "${B}Top $n clients${N}"
+  awk 'NR==FNR { name[$3]=$4; next }
+       match($0, /query\[[A-Za-z0-9]+\] [^ ]+ from [0-9.]+/) { split(substr($0,RSTART,RLENGTH),a," "); ip=a[4]; c[ip]++ }
+       END { for (ip in c) printf "%7d %-16s %s\n", c[ip], ip, (ip in name ? name[ip] : "") }' "$leases" "$f" \
+    | sort -rn | head -n "$n"
+  echo; echo "${B}Top $n blocked${N}"
+  grep -E ' (config|[^ ]*blocklists\.hosts) [^ ]+ is (NXDOMAIN|0\.0\.0\.0)' "$f" | awk '{print $(NF-2)}' \
+    | sort | uniq -c | sort -rn | head -n "$n"
+  echo; printf '%sTotal queries: %s, blocked: %s%s\n' "$D" "$(grep -c 'query\[' "$f")" \
+    "$(grep -cE ' (config|[^ ]*blocklists\.hosts) [^ ]+ is (NXDOMAIN|0\.0\.0\.0)' "$f")" "$N"
+}
+
+cmd_capture() {
+  require_running
+  have tcpdump || die "tcpdump is required"
+  trap ':' INT   # let tcpdump handle Ctrl-C, then continue to print the summary
+  if (( LIVE )); then tcpdump -i "$LAN" -n -l "${POS[@]}"; return 0; fi
+  install -d -m 755 "$CAPTURE_DIR"
+  chown "$REAL_USER" "$CAPTURE_DIR" 2>/dev/null
+  local file
+  file="$CAPTURE_DIR/$NAME-$(date +%Y%m%d-%H%M%S).pcap"
+  info "Capturing on $LAN${POS[*]:+ (filter: ${POS[*]})} → $file   ${D}Ctrl-C to stop${N}"
+  tcpdump -i "$LAN" -n -s 0 -U -Z "$REAL_USER" -w "$file" "${POS[@]}"
+  [[ -f $file ]] && ok "Saved $file ($(du -h "$file" | cut -f1)) - open with: wireshark $file"
+}
+
+cmd_scan() {
+  require_running
+  local mode=${POS[0]:-hosts}
+  if have nmap; then
+    case $mode in
+      hosts) info "Host discovery on $NET"; nmap -sn -n "$NET" ;;
+      ports) local t=("${POS[@]:1}"); (( ${#t[@]} )) || t=("$NET")
+             info "Service scan of ${t[*]} (top 1000 ports)"; nmap -sV -T4 --open "${t[@]}" ;;
+      *)     info "Service scan of ${POS[*]}"; nmap -sV -T4 --open "${POS[@]}" ;;
+    esac
+    return
+  fi
+  [[ $mode == hosts ]] || die "port scans need nmap (apt install nmap)"
+  info "nmap not found - ping sweep of $NET"
+  local ip n=0
+  while read -r ip; do
+    ping -c1 -W1 "$ip" >/dev/null 2>&1 &
+    (( ++n % 64 == 0 )) && wait
+  done < <(python3 -I -c 'import ipaddress,sys
+n=ipaddress.ip_network(sys.argv[1])
+for h in list(n.hosts())[:1024]: print(h)' "$NET")
+  wait
+  ip -4 neigh show dev "$LAN" | grep -v FAILED
+}
+
+# ----------------------------------------------------------------------------
+# Live management (no restart needed)
+# ----------------------------------------------------------------------------
+list_has() { grep -qxF -- "$2" "$STATE_DIR/$1"; }
+list_add() { list_has "$1" "$2" && return 1; printf '%s\n' "$2" >>"$STATE_DIR/$1"; }
+list_del() { # FILE exact|prefix VALUE -> 0 if something was removed
+  local f=$STATE_DIR/$1 tmp rc
+  tmp=$(mktemp)
+  awk -v m="$2" -v v="$3" 'BEGIN { r = 1 }
+      (m == "exact" && $0 == v) || (m == "prefix" && index($0, v) == 1) { r = 0; next }
+      { print } END { exit r }' "$f" >"$tmp"
+  rc=$?
+  cat "$tmp" >"$f"; rm -f "$tmp"
+  return $rc
+}
+sub_usage() { die "usage: $PROG $1"; }
+
+cmd_block() {
+  require_running
+  local act=${POS[0]:-list} d changed=0
+  case $act in
+    list) sed '/^$/d' "$STATE_DIR/blocked_domains"; return ;;
+    add|del)
+      (( ${#POS[@]} > 1 )) || sub_usage "block add|del DOMAIN..."
+      for d in "${POS[@]:1}"; do
+        d=${d,,}; d=${d#\*.}
+        is_domain "$d" || { warn "skipping invalid domain '$d'"; continue; }
+        if [[ $act == add ]]; then
+          if list_add blocked_domains "$d"; then ok "blocked $d (+ subdomains)"; changed=1; else info "$d already blocked"; fi
+        else
+          if list_del blocked_domains exact "$d"; then ok "unblocked $d"; changed=1; else info "$d was not blocked"; fi
+        fi
+      done
+      (( changed )) && { gen_servers; reload_dnsmasq; } ;;
+    *) sub_usage "block [list] | block add|del DOMAIN..." ;;
+  esac
+}
+
+cmd_dns() {
+  require_running
+  local act=${POS[0]:-list} name=${POS[1]:-} ip=${POS[2]:-}
+  case $act in
+    list) printf "${B}%-30s %s${N}\n" NAME IP; sed '/^$/d; s/=/ /' "$STATE_DIR/records" | awk '{printf "%-30s %s\n",$1,$2}'
+          printf '%-30s %s\n' "router${DNS_DOMAIN:+.$DNS_DOMAIN}" "$GW" ;;
+    add)  parse_record "$name=$ip" >/dev/null || sub_usage "dns add NAME IP"
+          list_del records prefix "$name=" || true
+          list_add records "$name=$ip"; gen_hosts; reload_dnsmasq; ok "$name → $ip" ;;
+    del)  [[ -n $name ]] || sub_usage "dns del NAME"
+          list_del records prefix "$name=" && { gen_hosts; reload_dnsmasq; ok "removed $name"; } || die "no record named $name" ;;
+    flush) reload_dnsmasq; ok "DNS cache flushed" ;;
+    *)    sub_usage "dns [list] | dns add NAME IP | dns del NAME | dns flush" ;;
+  esac
+}
+
+cmd_reserve() {
+  require_running
+  local act=${POS[0]:-list} mac=${POS[1]:-} ip=${POS[2]:-} host=${POS[3]:-}
+  mac=${mac,,}
+  case $act in
+    list) printf "${B}%-18s %-16s %s${N}\n" MAC IP HOSTNAME
+          while IFS= read -r l; do parse_reservation "$l"; done <"$STATE_DIR/reservations" | awk '{printf "%-18s %-16s %s\n",$1,$2,$3}' ;;
+    add)  parse_reservation "$mac,$ip${host:+,$host}" >/dev/null || sub_usage "reserve add MAC IP [HOSTNAME]"
+          list_del reservations prefix "$mac," || true
+          list_add reservations "$mac,$ip${host:+,$host}"; gen_dhcp_hosts; reload_dnsmasq
+          ok "$mac will get $ip${host:+ ($host)} on its next DHCP request" ;;
+    del)  is_mac "$mac" || sub_usage "reserve del MAC"
+          list_del reservations prefix "$mac," && { gen_dhcp_hosts; reload_dnsmasq; ok "removed reservation for $mac"; } || die "no reservation for $mac" ;;
+    *)    sub_usage "reserve [list] | reserve add MAC IP [HOSTNAME] | reserve del MAC" ;;
+  esac
+}
+
+cmd_forward() {
+  require_running
+  local act=${POS[0]:-list} spec=${POS[1]:-} p w i l
+  case $act in
+    list) printf "${B}%-6s %-10s %s${N}\n" PROTO WAN_PORT DESTINATION
+          while IFS= read -r spec; do read -r p w i l < <(parse_forward "$spec") && printf '%-6s %-10s %s:%s\n' "$p" "$w" "$i" "$l"; done <"$STATE_DIR/forwards"
+          echo "${D}Reachable at $(iface_ipv4 "$WAN" | sed 's|/[0-9]*||g'):<WAN_PORT> from the WAN side.${N}" ;;
+    add)  parse_forward "$spec" >/dev/null || sub_usage "forward add tcp|udp:WAN_PORT:LAN_IP[:LAN_PORT]"
+          list_add forwards "$spec" || die "already present"
+          nft_sync_forwards && ok "forwarding $spec" ;;
+    del)  [[ -n $spec ]] || sub_usage "forward del SPEC"
+          list_del forwards exact "$spec" || die "no such forward '$spec' (see: $PROG forward list)"
+          nft_sync_forwards && ok "removed $spec" ;;
+    *)    sub_usage "forward [list] | forward add|del tcp|udp:WAN_PORT:LAN_IP[:LAN_PORT]" ;;
+  esac
+}
+
+mac_of() { # MAC or IP -> MAC
+  local x=${1,,}
+  is_mac "$x" && { echo "$x"; return; }
+  is_ipv4 "$x" || return 1
+  local m
+  m=$(awk -v ip="$x" '$3==ip {print $2}' "$STATE_DIR/dnsmasq.leases" 2>/dev/null | head -1)
+  [[ -z $m ]] && m=$(ip -4 neigh show "$x" dev "$LAN" | awk '{for(i=1;i<=NF;i++) if($i=="lladdr") print $(i+1)}')
+  [[ -n $m ]] && echo "${m,,}"
+}
+cmd_client() {
+  local act=${POS[0]:-list}
+  [[ $act == list ]] && { cmd_clients; return; }
+  require_running
+  local who=${POS[1]:-} mac
+  [[ -n $who ]] || sub_usage "client block|unblock MAC|IP"
+  mac=$(mac_of "$who") || die "cannot resolve '$who' to a MAC address (not in leases/neighbours)"
+  case $act in
+    block)
+      list_add blocked_macs "$mac" || { info "$mac is already blocked"; return; }
+      nft_sync_macs; gen_dhcp_hosts; reload_dnsmasq
+      if [[ -n $WIFI_SSID ]] && have hostapd_cli; then try hostapd_cli -p "$STATE_DIR/hostapd-ctrl" deauthenticate "$mac"; fi
+      ok "blocked $mac (no DHCP, no traffic)" ;;
+    unblock)
+      list_del blocked_macs exact "$mac" || die "$mac is not blocked"
+      nft_sync_macs; gen_dhcp_hosts; reload_dnsmasq; ok "unblocked $mac" ;;
+    *) sub_usage "client [list] | client block|unblock MAC|IP" ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
+# Profiles & config
+# ----------------------------------------------------------------------------
+emit_yaml() { # dump current (finalized) config as a commented YAML profile
+  local mask=${1:-0} v i depth t val ind x
+  local -a parts prev=()
+  echo "# chokepoint profile - generated $(date '+%F %T') by $PROG $VERSION"
+  echo "# Use with: $PROG start -p <this-file>     Reference: $PROG help config"
+  for v in "${S_VARS[@]}"; do
+    IFS=. read -ra parts <<<"${S_PATH[$v]}"
+    depth=$(( ${#parts[@]} - 1 ))
+    for (( i=0; i<depth; i++ )); do
+      if [[ ${prev[i]:-} != "${parts[i]}" ]]; then
+        echo; printf '%*s%s:\n' $((i*2)) '' "${parts[i]}"
+        prev=("${prev[@]:0:i}" "${parts[i]}")
+      fi
+    done
+    prev=("${prev[@]:0:depth}")
+    (( depth == 0 )) && echo
+    ind=$(printf '%*s' $((depth*2)) '')
+    printf '%s# %s\n' "$ind" "${S_HELP[$v]}"
+    val=${!v-}; t=${S_TYPE[$v]}
+    [[ $v == WIFI_PASSPHRASE && -n $val && $mask == 1 ]] && val='********'
+    case $t in
+      bool|int) printf '%s%s: %s\n' "$ind" "${parts[depth]}" "${val:-''}" ;;
+      list|clist)
+        if [[ -z $val ]]; then printf '%s%s: []\n' "$ind" "${parts[depth]}"
+        else printf '%s%s:\n' "$ind" "${parts[depth]}"
+             while IFS= read -r x; do printf '%s  - %s\n' "$ind" "$(yaml_quote "$x")"; done <<<"$val"; fi ;;
+      *) printf '%s%s: %s\n' "$ind" "${parts[depth]}" "$(yaml_quote "$val")" ;;
+    esac
+  done
+}
+
+cmd_config() {
+  if [[ ${POS[0]:-} == running ]]; then require_running; else config_for_start >/dev/null; fi
+  local mask=0; [[ -t 1 ]] && mask=1
+  emit_yaml "$mask"
+}
+
+cmd_init() {
+  local target=${POS[0]:-}
+  load_config; finalize_config
+  if [[ -z $target ]]; then emit_yaml; return; fi
+  if [[ $target != */* && $target != *.yml && $target != *.yaml ]]; then
+    [[ $NAME == default && -z ${CFG[NAME]:-} ]] && NAME=$(sanitize_name "$target")
+    target="$USER_HOME/.config/chokepoint/profiles/$target.yml"
+  fi
+  [[ -e $target ]] && (( ! FORCE )) && die "$target already exists (--force to overwrite)"
+  mkdir -p "$(dirname "$target")"
+  (umask 077; emit_yaml >"$target")
+  [[ $EUID == 0 && -n ${SUDO_USER:-} ]] && chown -R "$SUDO_USER" "$(dirname "$target")"
+  ok "Profile written: $target"
+  echo "  Edit it, then: $PROG start -p $(basename "${target%.*}")"
+}
+
+cmd_profiles() {
+  local d f n desc any=0 running
+  running=" $(list_instances | paste -sd' ' -) "
+  for d in "${PROFILE_DIRS[@]}"; do
+    [[ -d $d ]] || continue
+    local first=1
+    for f in "$d"/*.yml "$d"/*.yaml; do
+      [[ -f $f ]] || continue
+      (( first )) && { echo "${B}$d${N}"; first=0; }
+      any=1
+      n=$(basename "${f%.*}")
+      desc=$(sed -n "s/^description:[[:space:]]*//p" "$f" | head -1 | sed "s/^[\"']//; s/[\"']$//")
+      printf '  %-18s %s%s\n' "$n" "${desc:-${D}(no description)${N}}" "$([[ $running == *" $n "* ]] && echo " ${G}[running]${N}")"
+    done
+  done
+  (( any )) || info "No profiles found. Create one: $PROG init NAME --lan eth1 ..."
+  echo; echo "${D}Search path: ${PROFILE_DIRS[*]}${N}"
+}
+
+cmd_check() {
+  local c purpose
+  echo "${B}Dependencies${N}"
+  while IFS='|' read -r c purpose; do
+    if have "$c"; then printf '  %s✔%s %-12s %s\n' "$G" "$N" "$c" "$purpose"
+    else printf '  %s✘%s %-12s %s\n' "$R" "$N" "$c" "$purpose"; fi
+  done <<'EOF'
+ip|required (iproute2)
+nft|required (nftables)
+dnsmasq|required for DHCP/DNS (dnsmasq-base)
+python3|required (address math, YAML profiles)
+iptables|optional: compatibility with Docker/UFW policies
+nmcli|optional: stop NetworkManager from fighting over LAN
+hostapd|optional: Wi-Fi access point mode
+tc|optional: bandwidth shaping
+tcpdump|optional: capture command
+nmap|optional: scan command
+curl|optional: blocklist downloads
+EOF
+  have python3 && python3 -c 'import yaml' 2>/dev/null && echo "  ${G}✔${N} PyYAML       full YAML support" \
+    || echo "  ${Y}!${N} PyYAML       not found - built-in minimal YAML parser will be used"
+  echo; echo "${B}Interfaces${N}"
+  local defif; defif=$(default_iface)
+  ip -br link | while read -r ifc st _; do
+    [[ $ifc == lo ]] && continue
+    ifc=${ifc%@*}
+    local kind=ether
+    iface_is_wifi "$ifc" && kind=wifi
+    [[ -e /sys/class/net/$ifc/tun_flags ]] && kind=tun
+    [[ -d /sys/class/net/$ifc/bridge ]] && kind=bridge
+    printf '  %-16s %-7s %-8s %-20s %s\n' "$ifc" "$kind" "$st" "$(iface_ipv4 "$ifc")" \
+      "$([[ $ifc == "$defif" ]] && echo "${C}← default route (WAN candidate)${N}")"
+  done
+  echo; echo "${B}Running routers${N}"
+  local n; n=$(list_instances | paste -sd' ' -); echo "  ${n:-none}"
+  [[ -n $n ]] || true
+}
+
+# ----------------------------------------------------------------------------
+# Help
+# ----------------------------------------------------------------------------
+help_main() {
+cat <<EOF
+${B}$PROG $VERSION${N} - turn this Linux box into a router for a LAN port or Wi-Fi AP
+
+${B}USAGE${N}
+  $PROG ${C}<command>${N} [options] [args]
+
+${B}LIFECYCLE${N}
+  ${C}start${N}                       Bring the router up (needs --lan or a profile)
+  ${C}stop${N}                        Tear everything down (nothing is persistent)
+  ${C}restart${N}                     Stop + start (re-uses the running config unless new options given)
+  ${C}status${N}                      Show running routers, services and features
+
+${B}OBSERVE${N}
+  ${C}leases${N}                      DHCP leases
+  ${C}clients${N}                     Devices seen on the LAN (IP, MAC, hostname, flags)
+  ${C}logs${N} [N] [-f]               DNS queries / DHCP / AP events (tail, follow)
+  ${C}top${N} [N]                     Top domains, clients and blocked lookups (needs --log-queries)
+  ${C}capture${N} [BPF filter]        tcpdump on LAN to a pcap (--live to print instead)
+  ${C}scan${N} [hosts|ports [IP..]]   Discover hosts / service-scan with nmap
+
+${B}MANAGE LIVE${N} ${D}(applied instantly, no restart; lost on stop - put permanent ones in a profile)${N}
+  ${C}block${N} [list|add|del] DOMAIN..    Block domains (+ all subdomains) via DNS
+  ${C}dns${N} [list|add|del|flush] NAME IP Local DNS records
+  ${C}reserve${N} [list|add|del] MAC IP [HOST]  Static DHCP leases
+  ${C}forward${N} [list|add|del] SPEC      Port forwards WAN→LAN, SPEC = tcp|udp:WAN_PORT:LAN_IP[:LAN_PORT]
+  ${C}client${N} [list|block|unblock] MAC|IP  Cut a device off (DHCP + traffic, deauth on Wi-Fi)
+
+${B}PROFILES & TOOLS${N}
+  ${C}profiles${N}                    List available YAML profiles
+  ${C}init${N} [NAME|FILE]            Write a commented profile from defaults + given options
+  ${C}config${N} [running]            Print the effective config (or the running one) as YAML
+  ${C}check${N}                       Dependencies + interfaces overview
+  ${C}help${N} [examples|config]      This help, scenario cookbook, or YAML key reference
+
+${B}GENERAL OPTIONS${N}
+  -p, --profile NAME|FILE     Load a YAML profile; repeat to layer (later wins)
+  -c, --config FILE           Same as --profile
+  -n, --name NAME             Instance name - run several routers at once (one per LAN)
+      --set KEY=VALUE         Set any config key, e.g. --set dns.cache_size=5000
+      --dry-run               Print every command/ruleset instead of executing
+      --force                 Override safety checks / overwrite files
+  -f, --follow                Follow output (logs)
+      --live                  capture: print packets instead of saving a pcap
+      --no-color, -h/--help, -V/--version
+
+${B}NETWORK${N}
+      --lan IFACE             Interface the clients are on                [required]
+      --wan IFACE             Upstream to share (wlan0, eth0, tun0, ...)    [auto]
+  -a, --address IP/PREFIX     Router address on the LAN       [192.168.50.1/24]
+
+${B}DHCP${N}
+      --dhcp-range A-B        Pool, e.g. 192.168.50.100-192.168.50.150     [.10-last]
+      --lease TIME            Lease time (30m, 12h, infinite)               [12h]
+      --reserve MAC,IP[,HOST] Static lease (repeatable)
+      --dhcp-option OPT       Raw dnsmasq dhcp-option (repeatable)
+      --tftp-root DIR         Built-in TFTP server (PXE)
+      --boot-file FILE        PXE boot file (pxelinux.0, ipxe.efi, ...)
+      --no-dhcp               Don't serve DHCP (static clients only)
+
+${B}DNS${N}
+      --dns IP[#PORT]         Upstream resolver (repeatable)    [1.1.1.1 9.9.9.9]
+      --domain NAME           Local domain - clients are HOST.NAME           [lan]
+      --record NAME=IP        Local DNS record (repeatable)
+      --block DOMAIN          Block domain + subdomains (repeatable)
+      --blocklist-url URL     Hosts/domain list to download (repeatable)
+      --blocklist-file FILE   Local hosts/domain list (repeatable)
+      --log-queries           Log all DNS queries + DHCP (for logs/top)
+      --force-dns             Hijack clients' DNS (port 53) to the router
+      --cache-size N          DNS cache entries                            [1000]
+      --no-dns                Don't run DNS (clients get the upstream servers)
+
+${B}FIREWALL / SECURITY${N}
+      --sandbox               Shortcut: --isolate-host --block-private --block-dot
+                              --force-dns --log-queries (untrusted/IoT/malware lab)
+      --isolate-host          Clients can't reach this machine (except DHCP/DNS/...)
+      --block-private         Clients get Internet only - no private nets/other ifaces
+      --block-dot             Block DNS-over-TLS/QUIC (853) to keep DNS visible
+      --block-mac MAC         Deny a device (repeatable)
+      --forward SPEC          Port forward tcp|udp:WAN_PORT:LAN_IP[:LAN_PORT] (repeatable)
+      --proxy PORT            Transparent redirect of web traffic to local PORT
+      --proxy-ports LIST      Ports redirected to the proxy                [80,443]
+
+${B}SHAPING${N}
+      --rate-down RATE        Cap LAN download, e.g. 2mbit, 512kbit
+      --rate-up RATE          Cap LAN upload
+
+${B}WI-FI ACCESS POINT${N} ${D}(LAN must be a Wi-Fi card not connected elsewhere)${N}
+      --ssid NAME   --passphrase PSK   --band g|a   --channel N   --country CC   --hidden
+
+${B}HOOKS${N}
+      --post-up CMD / --pre-down CMD   Shell commands run as root after start / before stop
+
+${B}QUICK EXAMPLES${N}
+  ${D}# Share Wi-Fi internet with a device plugged into the Ethernet port${N}
+  $PROG start --lan eth1
+  ${D}# Use a saved profile, then check on it${N}
+  $PROG start -p iot-lab && $PROG status
+  ${D}# Profile + one-off override${N}
+  $PROG start -p home --rate-down 5mbit
+  ${D}# See what would happen, without touching anything${N}
+  $PROG start --lan eth1 --sandbox --dry-run
+  ${D}# Block a domain on the fly, then stop${N}
+  $PROG block add tiktok.com && $PROG stop
+
+More: ${C}$PROG help examples${N} (scenarios)  ·  ${C}$PROG help config${N} (YAML reference)
+Commands that change the system re-run themselves through sudo automatically.
+EOF
+}
+
+help_examples() {
+cat <<EOF
+${B}SCENARIO COOKBOOK${N}
+
+${M}1. Give a wired device Internet through your laptop's Wi-Fi${N}
+   $PROG start --lan eth1                       ${D}# WAN = default route (auto)${N}
+   $PROG leases                                   ${D}# what IP did it get?${N}
+
+${M}2. Several profiles side by side (one per LAN interface)${N}
+   $PROG init lab --lan eth1 --address 10.10.0.1/24 --log-queries
+   $PROG init hotspot --lan wlx00c0ca --ssid Lab-AP --passphrase 'S3cure-pass!'
+   $PROG start -p lab;  $PROG start -p hotspot
+   $PROG status;        $PROG stop -n hotspot
+
+${M}3. IoT / malware sandbox - watch everything a device does${N}
+   $PROG start --lan eth1 --name iot --sandbox --rate-down 2mbit
+   $PROG logs -f                     ${D}# every DNS lookup it makes${N}
+   $PROG capture                     ${D}# full pcap → /var/tmp/chokepoint/iot-*.pcap${N}
+   $PROG top                         ${D}# most-contacted domains / blocked lookups${N}
+   ${D}--sandbox: can't reach your host or your private networks, DNS can't be bypassed.${N}
+
+${M}4. Intercept a device/app's HTTP(S) with Burp or mitmproxy${N}
+   mitmproxy --mode transparent --showhost -p 8080 &       ${D}# or Burp: invisible proxying${N}
+   $PROG start --lan eth1 --proxy 8080 --block-dot --force-dns
+   ${D}Install the proxy CA on the device. Add --proxy-ports 80,443,8443 for more ports.${N}
+
+${M}5. Instant Wi-Fi access point (USB Wi-Fi dongle as LAN)${N}
+   $PROG start --lan wlx00c0ca --ssid TestNet --passphrase 'changeme123' --band g --channel 11
+   $PROG client block 192.168.50.23  ${D}# kick + ban a device${N}
+
+${M}6. Rogue/evil-twin style lab AP for authorized wireless assessments${N}
+   $PROG start --lan wlan1 --ssid 'Guest-WiFi' --log-queries --proxy 8080 --isolate-host
+   ${D}Only against networks/devices you are authorized to test.${N}
+
+${M}7. PXE boot server for OS deployment / rescue${N}
+   $PROG start --lan eth1 --tftp-root /srv/tftp --boot-file pxelinux.0
+   ${D}UEFI clients: --boot-file ipxe.efi   Combine with --no-dns if not needed.${N}
+
+${M}8. Lab network with fixed IPs and local names${N}
+   $PROG start --lan eth1 -a 10.20.0.1/24 --domain lab \\
+       --reserve aa:bb:cc:dd:ee:01,10.20.0.10,switch --record nas=10.20.0.5
+   $PROG dns add grafana 10.20.0.11     ${D}# resolves grafana / grafana.lab live${N}
+   $PROG reserve add aa:bb:cc:dd:ee:02 10.20.0.12 printer
+
+${M}9. Ad / tracker / malware filtering + parental control${N}
+   $PROG start --lan eth1 --force-dns --block-dot \\
+       --blocklist-url https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts \\
+       --block tiktok.com --block roblox.com
+   $PROG block add youtube.com;  $PROG block del youtube.com
+
+${M}10. Route a device through your VPN${N}
+   $PROG start --lan eth1 --wan tun0 --dns 10.8.0.1 --block-private
+   ${D}(For policy-routing VPNs like wg-quick, verify with: $PROG scan / curl from the device.)${N}
+
+${M}11. Simulate a slow / flaky link for app testing${N}
+   $PROG start --lan eth1 --rate-down 1mbit --rate-up 256kbit
+   ${D}Need latency/loss too? Hook it:  --post-up 'tc qdisc add dev \$CP_LAN parent 1:10 netem delay 200ms loss 2%'${N}
+
+${M}12. Expose a device's service to the outside network${N}
+   $PROG start --lan eth1 --forward tcp:8443:192.168.50.20:443 --reserve 11:22:33:44:55:66,192.168.50.20
+   $PROG forward add tcp:2222:192.168.50.20:22
+
+${M}13. Discover and fingerprint what's on the segment${N}
+   $PROG scan;  $PROG scan ports 192.168.50.23;  $PROG clients
+
+${M}14. Automation with hooks (start tools with the router)${N}
+   $PROG start -p iot-lab --post-up 'tcpdump -i \$CP_LAN -w /var/tmp/\$CP_NAME.pcap & echo \$! > \$CP_STATE/td.pid' \\
+                         --pre-down 'kill \$(cat \$CP_STATE/td.pid)'
+
+${M}15. Preview, export and reuse${N}
+   $PROG start --lan eth1 --sandbox --dry-run             ${D}# full command & nftables preview${N}
+   $PROG config --lan eth1 --sandbox > my.yml              ${D}# effective config as YAML${N}
+   $PROG config running > snapshot.yml                     ${D}# what is running right now${N}
+   CP_WIFI_PASSPHRASE='secret' $PROG start -p hotspot      ${D}# secrets via env (CP_<KEY>)${N}
+EOF
+}
+
+help_config() {
+  local v
+  cat <<EOF
+${B}CONFIGURATION${N}
+
+Precedence (highest first):  CLI flags  >  CP_<KEY> env vars  >  profiles (-p, later wins)  >  defaults
+  · List flags (--reserve, --record, --block, --forward, --dns, ...) ADD to the profile's list.
+  · --set accepts a YAML path or KEY:  --set firewall.block_private=true  /  --set DNS_CACHE_SIZE=5000
+  · Env vars use the KEY column:       CP_WIFI_PASSPHRASE=... CP_LAN=eth1 $PROG start
+  · Profile search path ('-p NAME' → NAME.yml):
+$(printf '      %s\n' "${PROFILE_DIRS[@]}")
+  · 'start' with no profile and no --lan uses the profile named 'default' if it exists.
+  · Quote MAC addresses and anything with ':' in YAML.
+
+${B}KEYS${N}
+EOF
+  printf "  ${B}%-28s %-27s %-6s %-16s${N} %s\n" "YAML PATH" KEY TYPE DEFAULT DESCRIPTION
+  for v in "${S_VARS[@]}"; do
+    printf '  %-28s %-27s %-6s %-16s %s\n' "${S_PATH[$v]}" "$v" "${S_TYPE[$v]/clist/list}" "${S_DEF[$v]:--}" "${S_HELP[$v]}"
+  done
+  cat <<'EOF'
+
+EXAMPLE PROFILE (profiles/iot-lab.yml)
+  description: "Isolated lab for untrusted IoT devices"
+  lan: eth1
+  wan: auto
+  address: 10.66.0.1/24
+  dhcp:
+    lease: 1h
+    reservations:
+      - "aa:bb:cc:dd:ee:ff,10.66.0.50,camera"
+  dns:
+    upstream: [9.9.9.9, 149.112.112.112]
+    log_queries: true
+    force: true
+    block_domains: [telemetry.example.com]
+  firewall:
+    isolate_host: true
+    block_private: true
+    block_dot: true
+  shaping:
+    download: 5mbit
+
+Generate a fully commented profile:  chokepoint.sh init my-profile --lan eth1 [options]
+EOF
+}
+
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+ORIG_ARGS=("$@")
+CMD="" POS=() PROFILES=() NAME_OPT="" FOLLOW=0 LIVE=0 FORCE=0 HELP=0 REUSE_STATE=0
+
+opt_val() { (( $1 > 0 )) || die "option $2 needs a value (see: $PROG help)"; }
+while (( $# )); do
+  a=$1; shift
+  if [[ $a == --*=* ]]; then set -- "${a#*=}" "$@"; a=${a%%=*}; fi
+  case $a in
+    --) POS+=("$@"); break ;;
+    -h|--help) HELP=1 ;;
+    -V|--version) echo "$PROG $VERSION"; exit 0 ;;
+    -p|--profile|-c|--config) opt_val $# "$a"; PROFILES+=("$1"); shift ;;
+    -n|--name) opt_val $# "$a"; NAME_OPT=$1; cli_op set NAME "$1"; shift ;;
+    --dry-run) DRY_RUN=1 ;;
+    --force) FORCE=1 ;;
+    -f|--follow) FOLLOW=1 ;;
+    --live) LIVE=1 ;;
+    --no-color) set_colors off ;;
+    --sandbox) for _k in FIREWALL_ISOLATE_HOST FIREWALL_BLOCK_PRIVATE FIREWALL_BLOCK_DOT DNS_FORCE DNS_LOG_QUERIES; do cli_op set "$_k" true; done ;;
+    --set)
+      opt_val $# "$a"; _k=${1%%=*}; _val=${1#*=}; shift
+      [[ $_k == "$_val" ]] && die "--set needs KEY=VALUE"
+      if [[ -n ${PATH2VAR[$_k]:-} ]]; then _k=${PATH2VAR[$_k]}
+      elif [[ -z ${S_PATH[${_k^^}]:-} ]]; then die "--set: unknown key '$_k' (see: $PROG help config)"
+      else _k=${_k^^}; fi
+      cli_op set "$_k" "$_val" ;;
+    -*)
+      [[ -n ${FLAGS[$a]:-} ]] || die "unknown option '$a' (see: $PROG help)"
+      _act=${FLAGS[$a]%%:*}; _k=${FLAGS[$a]#*:}
+      case $_act in
+        true|false) cli_op set "$_k" "$_act" ;;
+        *) opt_val $# "$a"; cli_op "$_act" "$_k" "$1"; shift ;;
+      esac ;;
+    *) if [[ -z $CMD ]]; then CMD=$a; else POS+=("$a"); fi ;;
+  esac
+done
+
+if (( HELP )) || [[ -z $CMD ]]; then
+  case ${CMD:-} in examples) help_examples ;; config) help_config ;; *) help_main ;; esac
+  exit 0
+fi
+
+case $CMD in
+  help)      case ${POS[0]:-} in examples|example|ex) help_examples ;; config|yaml|keys) help_config ;; *) help_main ;; esac ;;
+  start)     need_root; cmd_start ;;
+  stop)      need_root; cmd_stop ;;
+  restart)   need_root; cmd_restart ;;
+  status)    need_root; cmd_status ;;
+  leases)    need_root; cmd_leases ;;
+  clients)   need_root; cmd_clients ;;
+  logs|log)  need_root; cmd_logs ;;
+  top|stats) need_root; cmd_top ;;
+  capture|pcap) need_root; cmd_capture ;;
+  scan)      need_root; cmd_scan ;;
+  block)     need_root; cmd_block ;;
+  dns)       need_root; cmd_dns ;;
+  reserve)   need_root; cmd_reserve ;;
+  forward)   need_root; cmd_forward ;;
+  client)    need_root; cmd_client ;;
+  profiles)  cmd_profiles ;;
+  init)      cmd_init ;;
+  config)    [[ ${POS[0]:-} == running ]] && need_root; cmd_config ;;
+  check|doctor) cmd_check ;;
+  *) die "unknown command '$CMD' (see: $PROG help)" ;;
+esac

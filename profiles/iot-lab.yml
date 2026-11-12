@@ -1,0 +1,18 @@
+description: "Sandbox for untrusted IoT devices: Internet only, full DNS logging"
+lan: eth1
+wan: auto
+address: 10.66.0.1/24
+dhcp:
+  lease: 1h
+  reservations: []          # e.g. - "aa:bb:cc:dd:ee:ff,10.66.0.50,camera"
+dns:
+  upstream: [9.9.9.9, 149.112.112.112]
+  log_queries: true
+  force: true               # devices with hard-coded 8.8.8.8 still hit our DNS
+firewall:
+  isolate_host: true        # device can't touch this laptop
+  block_private: true       # ...or your home/corporate networks
+  block_dot: true           # no DNS-over-TLS bypass
+shaping:
+  download: 5mbit
+  upload: 2mbit
