@@ -457,6 +457,14 @@ PY
   fi
   if [[ -n $WIFI_SSID ]]; then
     iface_is_wifi "$LAN" || die "wifi.ssid is set but $LAN is not a Wi-Fi interface"
+    local phy modes
+    phy=$(cat "/sys/class/net/$LAN/phy80211/name" 2>/dev/null)
+    if [[ -n $phy ]] && have iw; then
+      modes=$(iw phy "$phy" info 2>/dev/null | sed -n '/Supported interface modes:/,/^\t[^\t]/p' | grep -o '\* .*' | sed 's/^\* //' | paste -sd, -)
+      if [[ -n $modes && ,$modes, != *,AP,* ]]; then
+        die "$LAN ($(basename "$(readlink -f "/sys/class/net/$LAN/device/driver")") driver) cannot run an access point - supported modes: ${modes//,/, }. Use an AP-capable adapter (check: iw list | grep -A8 'interface modes')"
+      fi
+    fi
     [[ $WIFI_BAND == a || $WIFI_BAND == g ]] || die "wifi.band must be 'g' (2.4GHz) or 'a' (5GHz)"
     (( ${#WIFI_SSID} <= 32 )) || die "SSID longer than 32 characters"
     if [[ -n $WIFI_PASSPHRASE ]]; then
@@ -789,7 +797,10 @@ wpa_passphrase=$WIFI_PASSPHRASE
 EOF
   )
   step "Starting access point '$WIFI_SSID' on $LAN (band $WIFI_BAND, channel $WIFI_CHANNEL)"
-  must hostapd -B -P "$STATE_DIR/hostapd.pid" -f "$STATE_DIR/hostapd.log" "$f"
+  if ! run hostapd -B -P "$STATE_DIR/hostapd.pid" -f "$STATE_DIR/hostapd.log" "$f"; then
+    [[ -s $STATE_DIR/hostapd.log ]] && { err "hostapd log:"; tail -n 8 "$STATE_DIR/hostapd.log" | sed 's/^/    /' >&2; }
+    die "hostapd failed to start the access point on $LAN"
+  fi
 }
 
 apply_shaping() {
